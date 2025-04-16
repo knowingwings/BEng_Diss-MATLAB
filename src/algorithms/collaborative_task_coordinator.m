@@ -1,132 +1,150 @@
-function [recovery_tasks, updated_assignments] = failure_recovery(robot_states, task_info, task_assignments, task_progress, heartbeat_signals, last_heartbeat_times, current_time, robot_id)
-% FAILURE_RECOVERY Implements the failure recovery mechanism
-%
-% Inputs:
-%   robot_states        - States of all robots in the system
-%   task_info           - Information about all tasks
-%   task_assignments    - Current task assignments
-%   task_progress       - Progress of each task (0-1)
-%   heartbeat_signals   - Latest heartbeat signals from all robots
-%   last_heartbeat_times - Time of last heartbeat from each robot
-%   current_time        - Current simulation time
-%   robot_id            - ID of the robot running this function
-%
-% Outputs:
-%   recovery_tasks      - Tasks that need to be recovered
-%   updated_assignments - Updated task assignments after recovery
-%
-% This implementation is based on failure recovery approach described in:
-% Zavlanos, M.M., Spesivtsev, L., Pappas, G.J. (2008). "A distributed auction 
-% algorithm for the assignment problem." IEEE Conference on Decision and Control.
-
-% Parameters
-heartbeat_threshold = 3.0;  % Time threshold for missing heartbeats (seconds)
-progress_threshold = 0.05;  % Minimum expected progress per minute
-progress_check_period = 60;  % Check progress every 60 seconds
-
-% Initialise outputs
-recovery_tasks = [];
-updated_assignments = task_assignments;
-
-% Get IDs of all robots except self
-num_robots = length(robot_states);
-other_robot_ids = setdiff(1:num_robots, robot_id);
-
-% Check for failures in other robots
-for i = 1:length(other_robot_ids)
-    other_robot_id = other_robot_ids(i);
+function [sync_signals] = collaborative_task_coordinator(task_info, task_assignments, task_progress, incoming_sync, robot_id, current_time)
+    % COLLABORATIVE_TASK_COORDINATOR Implements the leader-follower coordination for collaborative tasks
+    %
+    % Inputs:
+    %   task_info           - Information about all tasks
+    %   task_assignments    - Current task assignments
+    %   task_progress       - Progress of each task (0-1)
+    %   incoming_sync       - Incoming synchronisation signals from other robots
+    %   robot_id            - ID of the robot running this function
+    %   current_time        - Current simulation time
+    %
+    % Outputs:
+    %   sync_signals        - Outgoing synchronisation signals
+    %
+    % This implementation is based on the leader-follower paradigm described in:
+    % Mathematical Foundations of Decentralised Control for Dual Mobile Manipulators
     
-    % Failure detection logic
-    failed = false;
+    % Parameters
+    sync_timeout = 5.0;  % Maximum time to wait for synchronisation (seconds)
     
-    % Method 1: Heartbeat monitoring
-    if heartbeat_signals(other_robot_id) == 0 && ...
-       (current_time - last_heartbeat_times(other_robot_id) > heartbeat_threshold)
-        failed = true;
-        disp(['Robot ', num2str(robot_id), ' detected failure of Robot ', num2str(other_robot_id), ' via heartbeat monitoring.']);
+    % Extract collaborative tasks
+    num_tasks = size(task_info, 1);
+    collab_tasks = [];
+    for i = 1:num_tasks
+        if task_info(i, 11) > 0  % Check collaborative flag
+            collab_tasks = [collab_tasks, i];
+        end
     end
     
-    % Method 2: Progress monitoring
-    for task_idx = 1:length(task_assignments)
-        if task_assignments(task_idx) == other_robot_id
-            % Check if progress has stalled
-            if task_progress(task_idx) > 0 && task_progress(task_idx) < 1
-                expected_progress = task_progress(task_idx) + progress_threshold*(current_time/progress_check_period);
-                if task_progress(task_idx) < expected_progress
-                    failed = true;
-                    disp(['Robot ', num2str(robot_id), ' detected failure of Robot ', num2str(other_robot_id), ' via progress monitoring on Task ', num2str(task_idx), '.']);
-                    break;
+    % Initialise sync signals
+    % Format: [task_id, sync_phase, timestamp, robot_id]
+    % Sync phases: 
+    % 1 = leader requesting sync
+    % 2 = follower acknowledging
+    % 3 = leader confirming
+    % 4 = follower executing
+    % 5 = task complete
+    sync_signals = zeros(num_tasks, 4);
+    
+    % Process incoming sync signals
+    if ~isempty(incoming_sync)
+        for i = 1:size(incoming_sync, 1)
+            if incoming_sync(i, 1) > 0  % Valid sync signal
+                task_id = incoming_sync(i, 1);
+                sync_phase = incoming_sync(i, 2);
+                sender_time = incoming_sync(i, 3);
+                sender_id = incoming_sync(i, 4);
+                
+                % Check if this is a collaborative task this robot is involved in
+                if ismember(task_id, collab_tasks) && (task_assignments(task_id) == robot_id || task_assignments(task_id) == 3)
+                    % Determine if this robot is leader or follower
+                    % For simulation, assume robot with lower ID is leader
+                    is_leader = (robot_id < sender_id);
+                    
+                    if ~is_leader
+                        % Follower responds to leader's sync signals
+                        if sync_phase == 1  % Leader requesting sync
+                            % Check if prerequisites are complete and robot is ready
+                            if is_robot_ready_for_task(task_id, task_info, task_assignments, task_progress, robot_id)
+                                % Send acknowledgment
+                                sync_signals(task_id, :) = [task_id, 2, current_time, robot_id];
+                                disp(['Robot ', num2str(robot_id), ' (follower) acknowledging sync request for Task ', num2str(task_id)]);
+                            end
+                        elseif sync_phase == 3  % Leader confirming execution
+                            % Task is synchronised, execute joint action
+                            sync_signals(task_id, :) = [task_id, 4, current_time, robot_id];
+                            disp(['Robot ', num2str(robot_id), ' (follower) confirming execution for Task ', num2str(task_id)]);
+                        end
+                    else
+                        % Leader processes follower's responses
+                        if sync_phase == 2  % Follower acknowledged
+                            % Check if leader is also ready
+                            if is_robot_ready_for_task(task_id, task_info, task_assignments, task_progress, robot_id)
+                                % Confirm synchronised execution
+                                sync_signals(task_id, :) = [task_id, 3, current_time, robot_id];
+                                disp(['Robot ', num2str(robot_id), ' (leader) confirming sync for Task ', num2str(task_id)]);
+                            end
+                        elseif sync_phase == 4  % Follower confirmed execution
+                            % Both robots are executing the task
+                            if task_progress(task_id) >= 1.0
+                                % Task is complete
+                                sync_signals(task_id, :) = [task_id, 5, current_time, robot_id];
+                                disp(['Robot ', num2str(robot_id), ' (leader) marking Task ', num2str(task_id), ' as complete']);
+                            end
+                        end
+                    end
                 end
             end
         end
     end
     
-    % If failure detected, initiate recovery
-    if failed
-        % Identify tasks assigned to failed robot
-        failed_tasks = find(task_assignments == other_robot_id);
+    % Generate new sync signals for collaborative tasks this robot is assigned to
+    for i = 1:length(collab_tasks)
+        task_id = collab_tasks(i);
         
-        % Calculate recovery bids for each task
-        task_bids = zeros(length(failed_tasks), 2);  % [task_id, bid_value]
-        
-        for j = 1:length(failed_tasks)
-            task_id = failed_tasks(j);
+        % Check if this is a collaborative task assigned to this robot
+        if task_assignments(task_id) == robot_id || task_assignments(task_id) == 3
+            % Determine if this robot should be leader
+            % For simulation, assume robot with lower ID is leader
+            other_robot_id = 3 - robot_id;  % If robot_id is 1, other is 2, and vice versa
+            is_leader = (robot_id < other_robot_id);
             
-            % Special recovery bid calculation
-            % Factors for recovery bid
-            progress_factor = 1 - task_progress(task_id);  % Prioritise less completed tasks
-            
-            % Calculate number of dependent tasks (criticality)
-            dependents = 0;
-            for k = 1:size(task_info, 1)
-                dependencies = task_info(k, 8:10);
-                if any(dependencies == task_id)
-                    dependents = dependents + 1;
+            % If leader and no active sync signal, initiate sync
+            if is_leader && all(sync_signals(task_id, :) == 0) && task_progress(task_id) < 1.0
+                % Check if task is available (all prerequisites complete)
+                if is_task_available(task_id, task_info, task_assignments, task_progress)
+                    % Send initial sync request
+                    sync_signals(task_id, :) = [task_id, 1, current_time, robot_id];
+                    disp(['Robot ', num2str(robot_id), ' (leader) initiating sync request for Task ', num2str(task_id)]);
                 end
-            end
-            criticality_factor = dependents / size(task_info, 1);
-            
-            % Calculate urgency based on critical path
-            [critical_path, ~] = analyse_task_dependencies(task_info, ones(size(task_info, 1), 1));
-            urgency_factor = ismember(task_id, critical_path) * 0.5;
-            
-            % Calculate recovery bid
-            recovery_bid = 10*progress_factor + 8*criticality_factor + 5*urgency_factor;
-            
-            % Add to recovery tasks and bids
-            task_bids(j, :) = [task_id, recovery_bid];
-        end
-        
-        % Sort tasks by bid value (descending)
-        [~, idx] = sort(task_bids(:, 2), 'descend');
-        sorted_tasks = task_bids(idx, 1);
-        
-        % Store recovered tasks
-        recovery_tasks = [recovery_tasks; sorted_tasks];
-        
-        % Reassign tasks to this robot (in real system, would use modified auction)
-        for j = 1:length(sorted_tasks)
-            task_id = sorted_tasks(j);
-            
-            % Check capability match
-            robot_capabilities = robot_states(robot_id).capabilities;
-            task_capabilities = task_info(task_id, 3:7);
-            
-            robot_cap_norm = robot_capabilities / norm(robot_capabilities);
-            task_cap_norm = task_capabilities / norm(task_capabilities);
-            capability_match = dot(robot_cap_norm, task_cap_norm);
-            
-            % If capability match is sufficient, assign task to this robot
-            if capability_match > 0.4  % Threshold for capability match
-                updated_assignments(task_id) = robot_id;
-                disp(['Robot ', num2str(robot_id), ' recovering Task ', num2str(task_id), ' (capability match: ', num2str(capability_match), ').']);
-            else
-                % Cannot be assigned due to insufficient capabilities
-                updated_assignments(task_id) = 0;  % Mark as unassigned
-                disp(['Robot ', num2str(robot_id), ' cannot recover Task ', num2str(task_id), ' (insufficient capabilities).']);
             end
         end
     end
-end
-
-end
+    
+    end
+    
+    function ready = is_robot_ready_for_task(task_id, task_info, task_assignments, task_progress, robot_id)
+    % Check if the robot is ready to perform the task
+    
+    % Check if all prerequisites are complete
+    prereqs_complete = is_task_available(task_id, task_info, task_assignments, task_progress);
+    
+    % In a real system, would also check:
+    % - Robot proximity to task location
+    % - Appropriate end-effector configuration
+    % - Resource availability
+    
+    % For simulation, just check prerequisites
+    ready = prereqs_complete;
+    end
+    
+    function available = is_task_available(task_id, task_info, task_assignments, task_progress)
+    % Check if a task is available (all prerequisites complete)
+    
+    % Extract prerequisites
+    dependencies = task_info(task_id, 8:10);
+    dependencies = dependencies(dependencies > 0);
+    
+    % Check if all prerequisites are completed
+    all_complete = true;
+    for i = 1:length(dependencies)
+        dep_id = dependencies(i);
+        if task_progress(dep_id) < 1.0
+            all_complete = false;
+            break;
+        end
+    end
+    
+    available = all_complete;
+    end
