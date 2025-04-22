@@ -1,6 +1,6 @@
 # Decentralised Control Algorithm for Dual Mobile Manipulators
 
-A MATLAB implementation of a distributed auction algorithm for decentralised control of dual mobile manipulators in industrial assembly tasks, developed as part of my final year Mechatronics Engineering research/project at the University of Gloucestershire.
+A MATLAB implementation of a distributed auction algorithm for decentralised control of dual mobile manipulators in industrial assembly tasks, developed as part of my final year Mechatronics Engineering research/project at the University of Gloucestershire. The full ROS/Gazebo implemtation can be found ![here](https://github.com/knowingwings/dec_cont_BEng_Diss).
 
 ![Distributed Auction Algorithm Simulation](https://github.com/knowingwings/BEng_Diss-MATLAB/blob/main/figures/auction_convergence_plots/auction_algorithm_results.png)
 
