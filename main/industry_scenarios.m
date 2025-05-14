@@ -1,7 +1,6 @@
 % industry_scenarios.m
 % Industry-derived scenarios for distributed auction algorithm validation
 % Implements realistic automotive assembly task datasets and industrial scenarios
-% FIXED VERSION - Using utils_manager instead of direct utility calls
 
 function utils = industry_scenarios()
     % INDUSTRY_SCENARIOS - Returns function handles for industry-specific scenarios
@@ -158,8 +157,8 @@ function tasks = local_createAutomotiveAssemblyTasks(env, difficulty_level)
     
     % Shuffle positions to simulate realistic layout
     rng(42);  % For reproducibility
-    shuffled_indices = randperm(size(positions, 1), num_tasks);
-    selected_positions = positions(shuffled_indices, :);
+    shuffled_indices = randperm(size(positions, 1));
+    positions = positions(shuffled_indices, :);
     
     % Create task structures
     tasks = struct([]);
@@ -167,7 +166,7 @@ function tasks = local_createAutomotiveAssemblyTasks(env, difficulty_level)
     for i = 1:num_tasks
         tasks(i).id = i;
         tasks(i).name = components{i};
-        tasks(i).position = selected_positions(i, :);
+        tasks(i).position = positions(i, :);
         tasks(i).execution_time = execution_times.(components{i});
         tasks(i).capabilities_required = capability_requirements.(components{i});
         
@@ -1382,15 +1381,17 @@ function [results] = local_runIndustrialScenario(scenario_type, difficulty_level
     fprintf('RUNNING INDUSTRIAL SCENARIO: %s (Level %d)\n', upper(scenario_type), difficulty_level);
     fprintf('==============================================\n\n');
     
-    % Load utility functions using utils_manager
-    utils = utils_manager();
+    % Load utility functions
+    env_utils = environment_utils();
+    robot_utils = robot_utils();
+    auction_utils = auction_utils();
     
     % Create environment
-    env = utils.env.createEnvironment(4, 4);
+    env = env_utils.createEnvironment(4, 4);
     fprintf('Environment created successfully\n');
     
     % Create robots with different capabilities
-    robots = utils.robot.createRobots(2, env);
+    robots = robot_utils.createRobots(2, env);
     fprintf('Robots created successfully\n');
     
     % Create industry-specific tasks
@@ -1444,11 +1445,11 @@ function [results] = local_runIndustrialScenario(scenario_type, difficulty_level
     end
     
     % Initialize auction data
-    auction_data = utils.auction.initializeAuctionData(tasks, robots);
+    auction_data = auction_utils.initializeAuctionData(tasks, robots);
     
     % Run auction algorithm simulation
     fprintf('\nRunning distributed auction algorithm...\n');
-    [metrics, converged] = utils.auction.runAuctionSimulation(params, env, robots, tasks, true);
+    [metrics, converged] = auction_utils.runAuctionSimulation(params, env, robots, tasks, true);
     
     % Create result structure
     results = struct();
@@ -1457,13 +1458,11 @@ function [results] = local_runIndustrialScenario(scenario_type, difficulty_level
     results.include_disturbances = include_disturbances;
     results.tasks = tasks;
     results.robots = robots;
-    results.env = env;
     results.graph = graph;
     results.critical_path = critical_path;
     results.metrics = metrics;
     results.converged = converged;
     results.params = params;
-    results.auction_data = auction_data;
     
     if include_disturbances
         results.disturbances = disturbances;
