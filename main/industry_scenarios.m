@@ -818,7 +818,7 @@ function [graph, critical_path] = local_generateTaskDependencyGraph(tasks)
     
     fprintf('Generating task dependency graph...\n');
     
-    num_tasks = length(tasks);
+    num_tasks = numel(tasks);
     
     % Create adjacency matrix for dependencies
     adjacency_matrix = zeros(num_tasks, num_tasks);
@@ -947,6 +947,7 @@ function [graph, critical_path] = local_generateTaskDependencyGraph(tasks)
     graph.latest_finish = latest_finish;
     graph.slack = slack;
     graph.makespan = max_finish;
+    graph.critical_path = critical_path;  % Add critical path to the graph structure
     
     fprintf('Task dependency graph generated successfully.\n');
     fprintf('Makespan: %.2f minutes\n', graph.makespan);
@@ -976,8 +977,9 @@ function local_visualizeIndustrialScenario(env, robots, tasks, graph)
     rectangle('Position', [0, 0, env.width, env.height], 'EdgeColor', 'k', 'LineWidth', 2);
     hold on;
     
-    % Draw robots
-    for i = 1:length(robots)
+    % Draw robots - using numel instead of length
+    num_robots = numel(robots);
+    for i = 1:num_robots
         if isfield(robots(i), 'failed') && robots(i).failed
             plot(robots(i).position(1), robots(i).position(2), 'rx', 'MarkerSize', 15, 'LineWidth', 3);
         else
@@ -987,8 +989,9 @@ function local_visualizeIndustrialScenario(env, robots, tasks, graph)
              sprintf('Robot %d', i), 'FontSize', 10);
     end
     
-    % Draw tasks with colors based on type
-    for i = 1:length(tasks)
+    % Draw tasks with colors based on type - using numel instead of length
+    num_tasks = numel(tasks);
+    for i = 1:num_tasks
         % Determine task type based on name for coloring
         if isfield(tasks(i), 'name')
             if contains(tasks(i).name, {'engine', 'wheel', 'chassis', 'gearbox'})
@@ -1023,8 +1026,9 @@ function local_visualizeIndustrialScenario(env, robots, tasks, graph)
     % Draw dependencies as arrows
     if nargin >= 4 && ~isempty(graph)
         % Use adjacency matrix to find connections
-        for i = 1:size(graph.adjacency_matrix, 1)
-            for j = 1:size(graph.adjacency_matrix, 2)
+        adj_size = size(graph.adjacency_matrix);
+        for i = 1:adj_size(1)
+            for j = 1:adj_size(2)
                 if graph.adjacency_matrix(i, j) > 0
                     % Draw arrow from task i to task j
                     arrow_x = [tasks(i).position(1), tasks(j).position(1)];
@@ -1033,10 +1037,10 @@ function local_visualizeIndustrialScenario(env, robots, tasks, graph)
                     % Calculate arrow direction and length
                     dx = arrow_x(2) - arrow_x(1);
                     dy = arrow_y(2) - arrow_y(1);
-                    length = sqrt(dx^2 + dy^2);
+                    arrow_length = sqrt(dx^2 + dy^2);
                     
                     % Shorten arrow to avoid overlapping with markers
-                    if length > 0.3
+                    if arrow_length > 0.3
                         arrow_x(2) = arrow_x(1) + 0.9 * dx;
                         arrow_y(2) = arrow_y(1) + 0.9 * dy;
                     end
@@ -1066,11 +1070,12 @@ function local_visualizeIndustrialScenario(env, robots, tasks, graph)
         end
     else
         % If no graph provided, use task prerequisites
-        for i = 1:length(tasks)
+        for i = 1:num_tasks
             if isfield(tasks(i), 'prerequisites') && ~isempty(tasks(i).prerequisites)
-                for j = 1:length(tasks(i).prerequisites)
+                prereq_count = numel(tasks(i).prerequisites);
+                for j = 1:prereq_count
                     prereq = tasks(i).prerequisites(j);
-                    if prereq <= length(tasks)
+                    if prereq <= num_tasks
                         % Draw arrow from prerequisite to task
                         arrow_x = [tasks(prereq).position(1), tasks(i).position(1)];
                         arrow_y = [tasks(prereq).position(2), tasks(i).position(2)];
@@ -1078,10 +1083,10 @@ function local_visualizeIndustrialScenario(env, robots, tasks, graph)
                         % Calculate arrow direction and length
                         dx = arrow_x(2) - arrow_x(1);
                         dy = arrow_y(2) - arrow_y(1);
-                        length = sqrt(dx^2 + dy^2);
+                        arrow_length = sqrt(dx^2 + dy^2);
                         
                         % Shorten arrow to avoid overlapping with markers
-                        if length > 0.3
+                        if arrow_length > 0.3
                             arrow_x(2) = arrow_x(1) + 0.9 * dx;
                             arrow_y(2) = arrow_y(1) + 0.9 * dy;
                         end
@@ -1114,7 +1119,15 @@ function local_visualizeIndustrialScenario(env, robots, tasks, graph)
     legend_labels{end+1} = 'Robot';
     
     % Add failed robot to legend if any
-    if any([robots.failed])
+    has_failed = false;
+    for i = 1:num_robots
+        if isfield(robots(i), 'failed') && robots(i).failed
+            has_failed = true;
+            break;
+        end
+    end
+    
+    if has_failed
         h = plot(NaN, NaN, 'rx', 'MarkerSize', 10, 'LineWidth', 2);
         h_legend = [h_legend, h];
         legend_labels{end+1} = 'Failed Robot';
@@ -1124,7 +1137,7 @@ function local_visualizeIndustrialScenario(env, robots, tasks, graph)
     task_colors = {'r', 'g', 'b', 'm', 'k'};
     task_types = {'Powertrain/Chassis', 'Interior/Body', 'Electronics', 'Final Assembly', 'Other'};
     
-    for i = 1:length(task_colors)
+    for i = 1:numel(task_colors)
         h = plot(NaN, NaN, 's', 'Color', task_colors{i}, 'MarkerSize', 10, ...
                  'LineWidth', 2, 'MarkerFaceColor', task_colors{i});
         h_legend = [h_legend, h];
@@ -1162,9 +1175,9 @@ function local_visualizeIndustrialScenario(env, robots, tasks, graph)
         eft = graph.earliest_finish;
         
         % Create colormap based on task types
-        gantt_colors = zeros(length(tasks), 3);
+        gantt_colors = zeros(num_tasks, 3);
         
-        for i = 1:length(tasks)
+        for i = 1:num_tasks
             if isfield(tasks(i), 'name')
                 if contains(tasks(i).name, {'engine', 'wheel', 'chassis', 'gearbox'})
                     gantt_colors(i, :) = [1, 0, 0];  % Red
@@ -1186,7 +1199,7 @@ function local_visualizeIndustrialScenario(env, robots, tasks, graph)
         [~, sort_idx] = sort(est);
         
         % Create Gantt chart
-        for i = 1:length(tasks)
+        for i = 1:num_tasks
             idx = sort_idx(i);
             
             % Draw task bar
@@ -1220,24 +1233,25 @@ function local_visualizeIndustrialScenario(env, robots, tasks, graph)
         
         % Add grid lines
         for i = 0:ceil(graph.makespan)
-            line([i, i], [0, length(tasks)+1], 'Color', [0.9, 0.9, 0.9], 'LineStyle', ':');
+            line([i, i], [0, num_tasks+1], 'Color', [0.9, 0.9, 0.9], 'LineStyle', ':');
         end
         
         % Set axis properties
-        ylim([0, length(tasks)+1]);
+        ylim([0, num_tasks+1]);
         xlim([0, ceil(graph.makespan * 1.1)]);
         xlabel('Time (minutes)');
         ylabel('Tasks');
         title('Assembly Schedule');
         
         % Create custom y-tick labels
-        yticks(1:length(tasks));
+        yticks(1:num_tasks);
         idx_labels = arrayfun(@(x) sprintf('%d', x), sort_idx, 'UniformOutput', false);
         yticklabels(idx_labels);
         
         % Add critical path annotation
         cp_text = sprintf('Critical Path: ');
-        for i = 1:length(graph.critical_path)
+        critical_path_size = numel(graph.critical_path);
+        for i = 1:critical_path_size
             if i > 1
                 cp_text = [cp_text, ' → '];
             end
@@ -1277,80 +1291,80 @@ function [disturbances] = local_simulateEnvironmentalDisturbances(env, num_distu
     
     % Initialize disturbances structure
     disturbances = struct();
-    disturbances.obstacles = struct([]);
-    disturbances.comm_blackouts = struct([]);
-    disturbances.sensor_noise = struct([]);
     
-    % Set random seed for reproducibility
-    rng(42);
+    % Pre-initialize obstacle array with all possible fields
+    obstacle_count = ceil(num_disturbances / 3);
+    obstacles(obstacle_count) = struct('type', '', 'position', [0, 0], 'radius', 0, 'size', [0, 0], 'orientation', 0);
     
     % Generate random obstacles
-    for i = 1:ceil(num_disturbances / 3)
-        obstacle = struct();
-        
+    for i = 1:obstacle_count
         % Determine obstacle type (circle or rectangle)
         if rand() < 0.5
             % Circular obstacle
-            obstacle.type = 'circle';
-            obstacle.position = [rand() * env.width, rand() * env.height];
-            obstacle.radius = 0.2 + 0.3 * rand();  % 0.2 - 0.5m radius
+            obstacles(i).type = 'circle';
+            obstacles(i).position = [rand() * env.width, rand() * env.height];
+            obstacles(i).radius = 0.2 + 0.3 * rand();  % 0.2 - 0.5m radius
+            % Keep other fields at default values
         else
             % Rectangular obstacle
-            obstacle.type = 'rectangle';
-            obstacle.position = [rand() * env.width, rand() * env.height];
-            obstacle.size = [0.3 + 0.4 * rand(), 0.3 + 0.4 * rand()];  % 0.3 - 0.7m sides
-            obstacle.orientation = rand() * pi;  % Random orientation
+            obstacles(i).type = 'rectangle';
+            obstacles(i).position = [rand() * env.width, rand() * env.height];
+            obstacles(i).size = [0.3 + 0.4 * rand(), 0.3 + 0.4 * rand()];  % 0.3 - 0.7m sides
+            obstacles(i).orientation = rand() * pi;  % Random orientation
+            % radius is unused but must exist in the structure
         end
-        
-        % Add obstacle to list
-        disturbances.obstacles(i) = obstacle;
     end
+    
+    % Assign to disturbances
+    disturbances.obstacles = obstacles;
+    
+    % Pre-initialize comm_blackouts with consistent structure
+    blackout_count = ceil(num_disturbances / 3);
+    comm_blackouts(blackout_count) = struct('start_time', 0, 'duration', 0, 'position', [0, 0], 'radius', 0);
     
     % Generate communication blackouts
-    for i = 1:ceil(num_disturbances / 3)
-        blackout = struct();
-        
+    for i = 1:blackout_count
         % Random start time
-        blackout.start_time = 5 + 45 * rand();  % Start between 5-50 minutes
+        comm_blackouts(i).start_time = 5 + 45 * rand();  % Start between 5-50 minutes
         
         % Random duration
-        blackout.duration = 1 + 4 * rand();  % 1-5 minutes
+        comm_blackouts(i).duration = 1 + 4 * rand();  % 1-5 minutes
         
         % Random affected area (circular region)
-        blackout.position = [rand() * env.width, rand() * env.height];
-        blackout.radius = 1.0 + 1.0 * rand();  % 1-2m radius
-        
-        % Add blackout to list
-        disturbances.comm_blackouts(i) = blackout;
+        comm_blackouts(i).position = [rand() * env.width, rand() * env.height];
+        comm_blackouts(i).radius = 1.0 + 1.0 * rand();  % 1-2m radius
     end
     
+    disturbances.comm_blackouts = comm_blackouts;
+    
+    % Pre-initialize sensor_noise with consistent structure
+    noise_count = ceil(num_disturbances / 3);
+    sensor_noise(noise_count) = struct('start_time', 0, 'duration', 0, 'type', '', 'magnitude', 0);
+    
     % Generate sensor noise profiles
-    for i = 1:ceil(num_disturbances / 3)
-        noise = struct();
-        
+    for i = 1:noise_count
         % Random start time
-        noise.start_time = 10 + 30 * rand();  % Start between 10-40 minutes
+        sensor_noise(i).start_time = 10 + 30 * rand();  % Start between 10-40 minutes
         
         % Random duration
-        noise.duration = 2 + 3 * rand();  % 2-5 minutes
+        sensor_noise(i).duration = 2 + 3 * rand();  % 2-5 minutes
         
         % Random noise type (position, force, vision)
         noise_types = {'position', 'force', 'vision'};
-        noise.type = noise_types{randi(length(noise_types))};
+        sensor_noise(i).type = noise_types{randi(length(noise_types))};
         
         % Noise magnitude
-        switch noise.type
+        switch sensor_noise(i).type
             case 'position'
-                noise.magnitude = 0.002 + 0.005 * rand();  % 2-7mm position noise
+                sensor_noise(i).magnitude = 0.002 + 0.005 * rand();  % 2-7mm position noise
             case 'force'
-                noise.magnitude = 1.0 + 2.0 * rand();  % 1-3N force noise
+                sensor_noise(i).magnitude = 1.0 + 2.0 * rand();  % 1-3N force noise
             case 'vision'
-                noise.magnitude = 0.05 + 0.1 * rand();  % 5-15% vision noise
+                sensor_noise(i).magnitude = 0.05 + 0.1 * rand();  % 5-15% vision noise
         end
-        
-        % Add noise to list
-        disturbances.sensor_noise(i) = noise;
     end
+    
+    disturbances.sensor_noise = sensor_noise;
     
     fprintf('Environmental disturbances generated:\n');
     fprintf('  - %d obstacles\n', length(disturbances.obstacles));
@@ -1381,17 +1395,18 @@ function [results] = local_runIndustrialScenario(scenario_type, difficulty_level
     fprintf('RUNNING INDUSTRIAL SCENARIO: %s (Level %d)\n', upper(scenario_type), difficulty_level);
     fprintf('==============================================\n\n');
     
-    % Load utility functions
-    env_utils = environment_utils();
-    robot_utils = robot_utils();
-    auction_utils = auction_utils();
+    % Load utility functions using utils_manager for general utilities
+    utils = utils_manager();
+    
+    % Load auction utilities directly to avoid field name issues
+    auction_utils_instance = auction_utils();
     
     % Create environment
-    env = env_utils.createEnvironment(4, 4);
+    env = utils.env.createEnvironment(4, 4);
     fprintf('Environment created successfully\n');
     
     % Create robots with different capabilities
-    robots = robot_utils.createRobots(2, env);
+    robots = utils.robot.createRobots(2, env);
     fprintf('Robots created successfully\n');
     
     % Create industry-specific tasks
@@ -1444,12 +1459,12 @@ function [results] = local_runIndustrialScenario(scenario_type, difficulty_level
         params.failed_robot = [];     % No robot fails
     end
     
-    % Initialize auction data
-    auction_data = auction_utils.initializeAuctionData(tasks, robots);
+    % Initialize auction data - using direct auction_utils call
+    auction_data = auction_utils_instance.initializeAuctionData(tasks, robots);
     
-    % Run auction algorithm simulation
+    % Run auction algorithm simulation - using direct auction_utils call
     fprintf('\nRunning distributed auction algorithm...\n');
-    [metrics, converged] = auction_utils.runAuctionSimulation(params, env, robots, tasks, true);
+    [metrics, converged] = auction_utils_instance.runAuctionSimulation(params, env, robots, tasks, true);
     
     % Create result structure
     results = struct();
@@ -1458,11 +1473,13 @@ function [results] = local_runIndustrialScenario(scenario_type, difficulty_level
     results.include_disturbances = include_disturbances;
     results.tasks = tasks;
     results.robots = robots;
+    results.env = env;
     results.graph = graph;
     results.critical_path = critical_path;
     results.metrics = metrics;
     results.converged = converged;
     results.params = params;
+    results.auction_data = auction_data;
     
     if include_disturbances
         results.disturbances = disturbances;
