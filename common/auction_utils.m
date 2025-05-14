@@ -178,7 +178,8 @@ function [auction_data, new_assignments, messages] = local_distributedAuctionSte
                     task_time = 1;  % Default execution time
                 end
                 
-                robot_utils = robot_utils();
+                utils = utils_manager();
+                robot_utils = utils.robot();
                 robots = robot_utils.updateRobotWorkload(robots, old_assignment, max_bidder, task_idx, task_time);
             end
             
@@ -343,7 +344,8 @@ function [metrics, converged] = local_runAuctionSimulation(params, env, robots, 
     % RUNAUCTIONSIMULATION Run the complete auction simulation
     
     % Load utilities
-    task_utils = task_utils();
+    utils = utils_manager();
+    task_utils = utils.task;
     
     % Initialize auction data
     auction_data = local_initializeAuctionData(tasks, robots);
@@ -544,7 +546,8 @@ function [metrics, converged] = local_runAuctionSimulation(params, env, robots, 
     local_analyzeTaskAllocation(auction_data, tasks);
     
     % Calculate makespan
-    robot_utils = robot_utils();
+    utils = utils_manager();
+    robot_utils = utils.robot();
     metrics.makespan = robot_utils.calculateMakespan(auction_data.assignment, tasks, robots);
     metrics.optimal_makespan = robot_utils.calculateOptimalMakespan(tasks, robots);
     metrics.optimality_gap = abs(metrics.makespan - metrics.optimal_makespan);

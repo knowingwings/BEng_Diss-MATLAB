@@ -307,7 +307,19 @@ function processed_data = local_processExperimentalResults(raw_results)
     for j = 1:length(param_names)
         % Extract unique values for this parameter
         if all(cellfun(@isnumeric, factor_values(:, j)))
-            unique_values = unique(cell2mat(factor_values(:, j)));
+            % Handle array parameters by extracting a representative value
+            unique_values = [];
+            for i = 1:size(factor_values, 1)
+                if isnumeric(factor_values{i, j}) && ~isempty(factor_values{i, j})
+                    if numel(factor_values{i, j}) > 1
+                        % For arrays, use the mean or first element as representative
+                        unique_values = [unique_values; mean(factor_values{i, j})];
+                    else
+                        unique_values = [unique_values; factor_values{i, j}];
+                    end
+                end
+            end
+            unique_values = unique(unique_values);
         else
             unique_values = unique(factor_values(:, j));
         end
@@ -333,7 +345,13 @@ function processed_data = local_processExperimentalResults(raw_results)
             
             for i = 1:length(raw_results)
                 if isnumeric(factor_values{i, j})
-                    factor_matrix(i, col_idx) = factor_values{i, j};
+                    % FIX: Handle array parameters by taking their mean or first element
+                    if numel(factor_values{i, j}) > 1
+                        factor_matrix(i, col_idx) = mean(factor_values{i, j});
+                        % Alternative: factor_matrix(i, col_idx) = factor_values{i, j}(1);
+                    else
+                        factor_matrix(i, col_idx) = factor_values{i, j};
+                    end
                 else
                     % If factor is categorical, convert to numeric levels
                     level_idx = find(strcmp(factor_values{i, j}, factor_levels{col_idx}));

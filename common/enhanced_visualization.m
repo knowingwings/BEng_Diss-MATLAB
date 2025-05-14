@@ -741,10 +741,14 @@ function local_visualizeRobotWorkspaces(robots, tasks, env, auction_data)
     % Calculate optimal workspace allocation
     [min_cost, best_robot] = min(workspace_costs, [], 1);
     
+    % FIX: Make sure dimensions match by squeezing best_robot to 2D
+    best_robot = squeeze(best_robot);
+    
     % Create mask for each robot's optimal workspace
     robot_masks = zeros(length(robots), size(best_robot, 1), size(best_robot, 2));
     
     for r = 1:length(robots)
+        % FIX: Create the masks correctly with matching dimensions
         robot_masks(r, :, :) = (best_robot == r);
     end
     
@@ -773,6 +777,7 @@ function local_visualizeRobotWorkspaces(robots, tasks, env, auction_data)
             % For each channel (R, G, B)
             for c = 1:3
                 channel = workspace_img(:, :, c);
+                % FIX: Properly reshape the robot_mask
                 robot_mask = squeeze(robot_masks(r, :, :));
                 channel(robot_mask == 1) = robot_colors(r, c) * 0.4; % Make workspace semi-transparent
                 workspace_img(:, :, c) = channel;
@@ -1030,12 +1035,15 @@ function local_visualizeBiddingHistory(auction_data, tasks)
     % Calculate number of iterations
     num_iterations = size(price_history, 2);
     
+    % FIX: Make sure we don't try to plot more tasks than we have price history for
+    num_tasks = min(length(tasks), size(price_history, 1));
+    
     % Calculate layout
-    subplot_rows = min(5, length(tasks));
-    subplot_cols = ceil(length(tasks) / subplot_rows);
+    subplot_rows = min(5, num_tasks);
+    subplot_cols = ceil(num_tasks / subplot_rows);
     
     % Plot tasks
-    for i = 1:length(tasks)
+    for i = 1:num_tasks
         subplot(subplot_rows, subplot_cols, i);
         
         % Plot price history for this task
@@ -1052,7 +1060,7 @@ function local_visualizeBiddingHistory(auction_data, tasks)
         
         % Add labels
         xlabel('Iteration');
-        if isfield(tasks, 'name')
+        if isfield(tasks, 'name') && i <= length(tasks)
             title(sprintf('Task %d: %s', i, tasks(i).name));
         else
             title(sprintf('Task %d', i));
@@ -1070,7 +1078,7 @@ function local_visualizeBiddingHistory(auction_data, tasks)
     % 1. Price evolution for all tasks
     subplot(2, 1, 1);
     
-    for i = 1:length(tasks)
+    for i = 1:num_tasks
         plot(1:num_iterations, price_history(i, :), 'LineWidth', 1.5);
         hold on;
     end
@@ -1081,10 +1089,10 @@ function local_visualizeBiddingHistory(auction_data, tasks)
     grid on;
     
     % Add legend
-    if length(tasks) <= 10
-        legend_entries = cell(length(tasks), 1);
-        for i = 1:length(tasks)
-            if isfield(tasks, 'name')
+    if num_tasks <= 10
+        legend_entries = cell(num_tasks, 1);
+        for i = 1:num_tasks
+            if isfield(tasks, 'name') && i <= length(tasks)
                 legend_entries{i} = sprintf('Task %d: %s', i, tasks(i).name);
             else
                 legend_entries{i} = sprintf('Task %d', i);
