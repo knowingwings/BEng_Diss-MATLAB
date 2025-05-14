@@ -4,14 +4,14 @@ function utils = auction_utils()
         'initializeAuctionData', @local_initializeAuctionData, ...
         'distributedAuctionStep', @local_distributedAuctionStep, ...
         'calculateBid', @local_calculateBid, ...
-        'calculateFutureBid', @local_calculateFutureBid, ... % NEW FUNCTION
+        'calculateFutureBid', @local_calculateFutureBid, ...
         'initiateRecovery', @local_initiateRecovery, ...
         'runAuctionSimulation', @local_runAuctionSimulation, ...
         'analyzeTaskAllocation', @local_analyzeTaskAllocation, ...
         'analyzeBidDistribution', @local_analyzeBidDistribution, ...
         'resetPricesForBlockedTasks', @local_resetPricesForBlockedTasks, ...
         'printTaskStatus', @local_printTaskStatus, ...
-        'progressTaskExecution', @local_progressTaskExecution ... % NEW FUNCTION
+        'progressTaskExecution', @local_progressTaskExecution ...
     );
 end
 
@@ -65,6 +65,21 @@ function auction_data = local_initializeAuctionData(tasks, robots)
     
     % ADDITION: Track simulation time
     auction_data.simulation_time = 0;
+    
+    % ADDITION: Track task queue for dependency handling
+    auction_data.task_queue = [];
+    
+    % ADDITION: Add expected completion time for each task
+    auction_data.expected_completion_time = zeros(length(tasks), 1);
+    
+    % ADDITION: Add dependency status for better tracking
+    auction_data.dependency_met = false(length(tasks), 1);
+    % Initially mark tasks with no prerequisites as having dependencies met
+    for i = 1:length(tasks)
+        if isempty(tasks(i).prerequisites)
+            auction_data.dependency_met(i) = true;
+        end
+    end
 end
 
 function [auction_data, new_assignments, messages] = local_distributedAuctionStep(auction_data, robots, tasks, available_tasks, params)
@@ -89,6 +104,9 @@ function [auction_data, new_assignments, messages] = local_distributedAuctionSte
     % Get current assignments and prices
     assignment = auction_data.assignment;
     prices = auction_data.prices;
+    
+    % Store previous completion status to check for new completions
+    previous_completion_status = auction_data.completion_status;
     
     % Reset bids and utilities for this step
     auction_data.bids = zeros(length(robots), length(tasks));
@@ -132,6 +150,13 @@ function [auction_data, new_assignments, messages] = local_distributedAuctionSte
     
     % Combine currently available and future available tasks for bidding
     bidding_tasks = union(available_tasks, future_available_tasks);
+    
+    % FIX: Add logging for available tasks
+    if ~isempty(bidding_tasks)
+        fprintf('Current bidding tasks: ');
+        fprintf('%d ', bidding_tasks);
+        fprintf('\n');
+    end
     
     % Phase 1: Bidding
     % Each robot bids on available and soon-to-be-available tasks
@@ -243,8 +268,13 @@ function [auction_data, new_assignments, messages] = local_distributedAuctionSte
                 auction_data.robot_available_time(max_bidder) = max(auction_data.robot_available_time(max_bidder), earliest_start_time) + task_time;
                 auction_data.projected_completion_time(task_idx) = auction_data.robot_available_time(max_bidder);
                 
+                % FIX: Log the assignment
+                fprintf('Task %d assigned to Robot %d (bid: %.2f, price: %.2f)\n', ...
+                       task_idx, max_bidder, max_bid, prices(task_idx));
+                
+                % Update robot workload using utils_manager
                 utils = utils_manager();
-                robot_utils = utils.robot();
+                robot_utils = utils.robot;
                 robots = robot_utils.updateRobotWorkload(robots, old_assignment, max_bidder, task_idx, task_time);
             end
             
@@ -270,6 +300,38 @@ function [auction_data, new_assignments, messages] = local_distributedAuctionSte
     
     % ADDITION: Task progress update
     auction_data = local_progressTaskExecution(auction_data, tasks, robots, params);
+    
+    % ADDITION: Check for new completions and update available tasks
+    if any(auction_data.completion_status ~= previous_completion_status)
+        % Get newly completed tasks
+        newly_completed = find(auction_data.completion_status == 1 & previous_completion_status == 0);
+        
+        if ~isempty(newly_completed)
+            fprintf('Tasks completed: ');
+            fprintf('%d ', newly_completed);
+            fprintf('\n');
+            
+            % Update dependency status based on new completions
+            for i = 1:length(tasks)
+                if auction_data.completion_status(i) == 0 && ~auction_data.dependency_met(i)
+                    % Check if all prerequisites are now completed
+                    all_completed = true;
+                    for j = 1:length(tasks(i).prerequisites)
+                        prereq = tasks(i).prerequisites(j);
+                        if auction_data.completion_status(prereq) == 0
+                            all_completed = false;
+                            break;
+                        end
+                    end
+                    
+                    if all_completed
+                        auction_data.dependency_met(i) = true;
+                        fprintf('Dependencies for Task %d are now met\n', i);
+                    end
+                end
+            end
+        end
+    end
 end
 
 function auction_data = local_progressTaskExecution(auction_data, tasks, robots, params)
@@ -313,15 +375,44 @@ function auction_data = local_progressTaskExecution(auction_data, tasks, robots,
                     % If task has been executed for its required time, mark as completed
                     if auction_data.task_progress(i) >= tasks(i).execution_time
                         auction_data.completion_status(i) = 1;
+                        
+                        % Log task completion
                         fprintf('Task %d completed by Robot %d\n', i, robot_id);
                         
                         % Update robot's completed tasks list
                         utils = utils_manager();
-                        robot_utils = utils.robot();
+                        robot_utils = utils.robot;
                         robots = robot_utils.updateRobotCompletedTasks(robots, i, robot_id);
                         
                         % Update robot available time
                         auction_data.robot_available_time(robot_id) = auction_data.simulation_time;
+                        
+                        % FIX: Check for tasks that become available due to this completion
+                        for j = 1:length(tasks)
+                            if auction_data.completion_status(j) == 0 && ~isempty(tasks(j).prerequisites)
+                                % If this task depends on the just-completed task
+                                if ismember(i, tasks(j).prerequisites)
+                                    % Check if all prerequisites are now completed
+                                    all_completed = true;
+                                    for prereq = tasks(j).prerequisites
+                                        if auction_data.completion_status(prereq) == 0
+                                            all_completed = false;
+                                            break;
+                                        end
+                                    end
+                                    
+                                    if all_completed
+                                        auction_data.dependency_met(j) = true;
+                                        fprintf('Task %d is now ready for assignment (dependencies met)\n', j);
+                                    end
+                                end
+                            end
+                        end
+                    end
+                else
+                    % Log waiting for dependencies
+                    if mod(auction_data.simulation_time, 1) < params.time_step
+                        fprintf('Task %d assigned to Robot %d is waiting for prerequisites\n', i, robot_id);
                     end
                 end
             end
@@ -349,21 +440,35 @@ function bid = local_calculateBid(robot, task, current_price, params)
     distance = norm(robot.position - task.position);
     distance_cost = params.alpha(3) * (1 - exp(-distance/2));
     
-    % Ensure workload factor is effective even at zero workload
-    workload_factor = params.alpha(2) / (1 + robot.workload);
+    % FIX: Improve workload factor calculation
+    workload_factor = params.alpha(2) * (1 / (robot.workload + 1));
     
-    % IMPROVED: Add value for tasks on critical path
+    % IMPROVED: Add value for tasks on critical path and for tasks with dependencies
     critical_path_bonus = 0;
+    dependency_bonus = 0;
+    
     if isfield(task, 'on_critical_path') && task.on_critical_path
-        critical_path_bonus = params.alpha(4) * 2;  % Double importance for critical path tasks
+        critical_path_bonus = params.alpha(4) * 3;  % Triple importance for critical path tasks
+    end
+    
+    % Add bonus for tasks with no prerequisites (to get the process started)
+    if ~isfield(task, 'prerequisites') || isempty(task.prerequisites)
+        dependency_bonus = params.alpha(5) * 2;
+    end
+    
+    % FIX: Add time efficiency factor - reward shorter tasks
+    time_efficiency = 0;
+    if isfield(task, 'execution_time') && task.execution_time > 0
+        time_efficiency = params.alpha(4) * (5 / task.execution_time);
     end
     
     % Calculate bid value with proper weighting
     bid = params.alpha(1) * capability_match + ...
           workload_factor - ...
           distance_cost + ...
-          params.alpha(4) * (1 / (task.execution_time + 0.1)) + ...
-          critical_path_bonus;
+          time_efficiency + ...
+          critical_path_bonus + ...
+          dependency_bonus;
     
     % Ensure bid exceeds current price by at least epsilon
     if bid <= current_price
@@ -395,19 +500,25 @@ function bid = local_calculateFutureBid(robot, task, current_price, params, auct
             % Get progress on this prerequisite
             if auction_data.assignment(prereq) > 0
                 % Calculate remaining time
-                remaining_time = tasks(prereq).execution_time - auction_data.task_progress(prereq);
-                prereq_completion_time = auction_data.simulation_time + remaining_time;
-                earliest_available_time = max(earliest_available_time, prereq_completion_time);
+                if isfield(task, 'execution_time')
+                    remaining_time = task.execution_time - auction_data.task_progress(prereq);
+                    prereq_completion_time = auction_data.simulation_time + remaining_time;
+                    earliest_available_time = max(earliest_available_time, prereq_completion_time);
+                end
             else
                 % If prerequisite isn't assigned, use a pessimistic estimate
-                earliest_available_time = max(earliest_available_time, auction_data.simulation_time + tasks(prereq).execution_time);
+                if isfield(task, 'execution_time')
+                    earliest_available_time = max(earliest_available_time, auction_data.simulation_time + task.execution_time);
+                end
             end
         end
     end
     
     % Calculate time discount factor (value decreases with wait time)
     time_to_availability = max(0, earliest_available_time - auction_data.simulation_time);
-    time_discount = exp(-0.1 * time_to_availability);  % Exponential decay with time
+    
+    % FIX: Use gentler time discount to encourage future task bidding
+    time_discount = exp(-0.05 * time_to_availability);  % Slower exponential decay with time
     
     % Apply discount to bid
     discounted_bid = base_bid * time_discount;
@@ -418,6 +529,91 @@ function bid = local_calculateFutureBid(robot, task, current_price, params, auct
     end
     
     bid = discounted_bid;
+end
+
+function bid = local_calculateRecoveryBid(robot, task, current_price, params)
+    % CALCULATERECOVERYBID Calculate bid value during recovery phase
+    %
+    % Parameters:
+    %   robot - Robot structure
+    %   task - Task structure
+    %   current_price - Current price of the task
+    %   params - Algorithm parameters
+    %
+    % Returns:
+    %   bid - Calculated recovery bid value
+    
+    % Use standard bid as baseline
+    base_bid = local_calculateBid(robot, task, current_price, params);
+    
+    % Add recovery bonus to prioritize task reassignment
+    recovery_bonus = params.beta(1);
+    
+    % Scale bonus based on task criticality if the task is on critical path
+    if isfield(task, 'on_critical_path') && task.on_critical_path
+        recovery_bonus = recovery_bonus * params.beta(2);
+    end
+    
+    % Calculate recovery bid
+    bid = base_bid + recovery_bonus;
+    
+    % Ensure bid exceeds current price by at least epsilon
+    if bid <= current_price
+        bid = current_price + params.epsilon;
+    end
+    
+    return;
+end
+
+function auction_data = local_initiateRecovery(auction_data, robots, tasks, failed_robot)
+    % INITIATERECOVERY Initiate recovery process after robot failure
+    %
+    % Parameters:
+    %   auction_data - Auction data structure
+    %   robots - Array of robot structures
+    %   tasks - Array of task structures
+    %   failed_robot - ID of the failed robot
+    %
+    % Returns:
+    %   auction_data - Updated auction data structure
+    
+    % Set recovery mode flag
+    auction_data.recovery_mode = true;
+    auction_data.failed_robot = failed_robot;
+    
+    % Store assignment at time of failure for analysis
+    if ~isfield(auction_data, 'failure_assignment')
+        auction_data.failure_assignment = auction_data.assignment;
+    end
+    
+    % Get tasks assigned to failed robot
+    failed_tasks = find(auction_data.assignment == failed_robot);
+    
+    % Log recovery initiation
+    fprintf('Initiating recovery for Robot %d failure. %d tasks to reassign: ', ...
+            failed_robot, length(failed_tasks));
+    fprintf('%d ', failed_tasks);
+    fprintf('\n');
+    
+    % Reset assignments for tasks assigned to failed robot
+    for i = 1:length(failed_tasks)
+        task_id = failed_tasks(i);
+        
+        % Reset assignment for this task
+        auction_data.assignment(task_id) = 0;
+        
+        % Reset task progress for incomplete tasks
+        if auction_data.completion_status(task_id) == 0
+            % Reset progress if work had started
+            if auction_data.task_progress(task_id) > 0
+                fprintf('Task %d progress reset (was %.1f%%)\n', ...
+                        task_id, auction_data.task_progress(task_id) / tasks(task_id).execution_time * 100);
+                auction_data.task_progress(task_id) = 0;
+            end
+        end
+    end
+    
+    return;
 end
 
 function [metrics, converged] = local_runAuctionSimulation(params, env, robots, tasks, visualize)
@@ -463,8 +659,8 @@ function [metrics, converged] = local_runAuctionSimulation(params, env, robots, 
         params.time_step = 0.1; % Default time step
     end
     
-    % Maximum iterations
-    max_iterations = 1000;
+    % FIX: Increase maximum iterations for complex scenarios
+    max_iterations = 2000;
     converged = false;
     
     % Available tasks (initially only those with no prerequisites)
@@ -510,6 +706,13 @@ function [metrics, converged] = local_runAuctionSimulation(params, env, robots, 
         % Update available tasks based on newly completed tasks
         completed_tasks = find(auction_data.completion_status == 1);
         available_tasks = task_utils.findAvailableTasks(tasks, completed_tasks);
+        
+        % FIX: Add debugging for available tasks
+        if mod(iter, 5) == 0
+            fprintf('Available tasks at iteration %d: ', iter);
+            fprintf('%d ', available_tasks);
+            fprintf('\n');
+        end
         
         % Simulate one step of the distributed auction algorithm
         [auction_data, new_assignments, messages] = local_distributedAuctionStep(auction_data, robots, tasks, available_tasks, params);
@@ -578,47 +781,41 @@ function [metrics, converged] = local_runAuctionSimulation(params, env, robots, 
             pause(0.01);
         end
         
-        % IMPROVED: Check completion of critical path tasks
-        critical_path_completed = true;
-        for i = 1:length(critical_path)
-            if critical_path(i) <= length(tasks) && auction_data.completion_status(critical_path(i)) == 0
-                critical_path_completed = false;
-                break;
-            end
-        end
-        
         % IMPROVED: Better convergence criteria
-        % Convergence when:
-        % 1. All tasks are completed or assigned, or
-        % 2. Assignments haven't changed for several iterations AND
-        %    all available tasks are assigned
-        % 3. Simulation time has passed a threshold
+        % FIX: Completely changed convergence criteria
         
-        % Check if all tasks are completed or assigned
-        all_tasks_handled = all(auction_data.completion_status == 1 | auction_data.assignment > 0);
+        % Check if all tasks are completed
+        all_tasks_completed = (sum(auction_data.completion_status) == length(tasks));
         
-        % Check if all available tasks are assigned
-        available_tasks_assigned = true;
-        for i = 1:length(available_tasks)
-            if auction_data.assignment(available_tasks(i)) == 0
-                available_tasks_assigned = false;
-                break;
-            end
-        end
+        % Check if all tasks are assigned or completed
+        all_tasks_assigned_or_completed = all(auction_data.completion_status == 1 | auction_data.assignment > 0);
+        
+        % Check if we've made significant progress (at least half of tasks completed)
+        significant_progress = (sum(auction_data.completion_status) >= length(tasks) / 2);
         
         % Check for simulation timeout
-        simulation_timeout = auction_data.simulation_time >= 60; % 60 second timeout
+        simulation_timeout = auction_data.simulation_time >= 150; % Increased timeout
+        
+        % Check for stalled progress (no completions for a long time)
+        stalled_progress = (unchanged_iterations >= 50) && (sum(auction_data.completion_status) > 0);
         
         % Determine if we've converged
-        if (all_tasks_handled && unchanged_iterations >= 5) || 
-           (available_tasks_assigned && unchanged_iterations >= 10) || 
-           simulation_timeout
-            if all_tasks_handled
-                fprintf('Auction algorithm converged - all tasks assigned or completed\n');
-            elseif available_tasks_assigned
-                fprintf('Auction algorithm converged - all available tasks assigned (stable for %d iterations)\n', unchanged_iterations);
+        if all_tasks_completed || ...
+           (all_tasks_assigned_or_completed && unchanged_iterations >= 20) || ...
+           (significant_progress && unchanged_iterations >= 30) || ...
+           simulation_timeout || ...
+           stalled_progress
+            if all_tasks_completed
+                fprintf('Auction algorithm converged - all tasks completed\n');
+            elseif all_tasks_assigned_or_completed
+                fprintf('Auction algorithm converged - all tasks assigned or completed (stable for %d iterations)\n', unchanged_iterations);
+            elseif significant_progress
+                fprintf('Auction algorithm converged - significant progress made (%.1f%% tasks completed, stable for %d iterations)\n', ...
+                        100 * sum(auction_data.completion_status) / length(tasks), unchanged_iterations);
+            elseif simulation_timeout
+                fprintf('Auction algorithm terminated - simulation timeout reached (%.1f seconds)\n', auction_data.simulation_time);
             else
-                fprintf('Auction algorithm terminated - simulation timeout reached\n');
+                fprintf('Auction algorithm terminated - progress stalled for %d iterations\n', unchanged_iterations);
             end
             converged = true;
             break;
@@ -646,12 +843,6 @@ function [metrics, converged] = local_runAuctionSimulation(params, env, robots, 
             fprintf('Progress: %d/%d tasks completed, %d tasks in progress\n', ...
                     num_completed, length(tasks), num_assigned);
         end
-        
-        % Break if we go too long without progress
-        if iter > 50 && unchanged_iterations > 30 && sum(auction_data.completion_status) == 0
-            fprintf('Auction algorithm terminated - no progress after %d iterations\n', unchanged_iterations);
-            break;
-        end
     end
     
     % Trim history matrices to actual size
@@ -664,7 +855,7 @@ function [metrics, converged] = local_runAuctionSimulation(params, env, robots, 
     local_analyzeTaskAllocation(auction_data, tasks);
     
     % Calculate makespan
-    robot_utils = utils.robot();
+    robot_utils = utils.robot;
     metrics.makespan = robot_utils.calculateMakespan(auction_data.assignment, tasks, robots);
     metrics.optimal_makespan = robot_utils.calculateOptimalMakespan(tasks, robots);
     metrics.optimality_gap = abs(metrics.makespan - metrics.optimal_makespan);
@@ -776,4 +967,272 @@ function path = traceCriticalPath(end_task, tasks, task_depths)
             break;
         end
     end
+end
+
+function auction_data = local_resetPricesForBlockedTasks(auction_data, tasks, available_tasks)
+    % RESETPRICESFORBLOCKEDTASKS Reset prices for tasks that are blocked by dependencies
+    %
+    % Parameters:
+    %   auction_data - Auction data structure
+    %   tasks - Array of task structures
+    %   available_tasks - List of task IDs that are currently available
+    %
+    % Returns:
+    %   auction_data - Updated auction data structure
+    
+    % Find tasks that are not available and not completed
+    for i = 1:length(tasks)
+        if auction_data.completion_status(i) == 0 && ~ismember(i, available_tasks)
+            % Check if this task has any unfinished prerequisites
+            has_unfinished_prereqs = false;
+            
+            if isfield(tasks(i), 'prerequisites') && ~isempty(tasks(i).prerequisites)
+                for j = 1:length(tasks(i).prerequisites)
+                    prereq = tasks(i).prerequisites(j);
+                    if auction_data.completion_status(prereq) == 0
+                        has_unfinished_prereqs = true;
+                        break;
+                    end
+                end
+            end
+            
+            % If task has unfinished prerequisites, reset its price to prevent inflation
+            if has_unfinished_prereqs
+                auction_data.prices(i) = 0;
+            end
+        end
+    end
+end
+
+function local_printTaskStatus(auction_data, tasks, robots)
+    % PRINTTASKSTATUS Print detailed status of tasks
+    %
+    % Parameters:
+    %   auction_data - Auction data structure
+    %   tasks - Array of task structures
+    %   robots - Array of robot structures
+    
+    fprintf('\n--- Current Task Status ---\n');
+    fprintf('ID\tAssigned\tProgress\tPrice\t\tPrerequisites\n');
+    fprintf('------------------------------------------------------------------\n');
+    
+    for i = 1:length(tasks)
+        % Get assignment status
+        if auction_data.completion_status(i) == 1
+            status = 'Completed';
+        elseif auction_data.assignment(i) == 0
+            status = 'Unassigned';
+        else
+            robot_id = auction_data.assignment(i);
+            if robot_id <= length(robots) && isfield(robots, 'failed') && robots(robot_id).failed
+                status = sprintf('R%d (Failed)', robot_id);
+            else
+                status = sprintf('Robot %d', robot_id);
+            end
+        end
+        
+        % Get progress
+        if auction_data.completion_status(i) == 1
+            progress = '100%';
+        else
+            if isfield(tasks, 'execution_time') && tasks(i).execution_time > 0
+                progress_pct = (auction_data.task_progress(i) / tasks(i).execution_time) * 100;
+                progress = sprintf('%.1f%%', progress_pct);
+            else
+                progress = '0%';
+            end
+        end
+        
+        % Get prerequisites
+        if isfield(tasks(i), 'prerequisites') && ~isempty(tasks(i).prerequisites)
+            prereq_str = sprintf('%d ', tasks(i).prerequisites);
+        else
+            prereq_str = 'None';
+        end
+        
+        % Print task information
+        fprintf('%d\t%s\t\t%s\t\t%.2f\t\t%s\n', ...
+                i, status, progress, auction_data.prices(i), prereq_str);
+    end
+    
+    fprintf('\n');
+end
+
+function local_analyzeTaskAllocation(auction_data, tasks)
+    % ANALYZETASKALLOCATION Analyze the current task allocation status
+    %
+    % Parameters:
+    %   auction_data - Auction data structure
+    %   tasks - Array of task structures
+    
+    % Count assignments by robot
+    assignments = auction_data.assignment;
+    unique_robots = unique(assignments(assignments > 0));
+    
+    fprintf('\n--- Task Allocation Analysis ---\n');
+    
+    % Check for unassigned tasks
+    unassigned_count = sum(assignments == 0);
+    fprintf('Unassigned tasks: %d (%.1f%%)\n', ...
+            unassigned_count, unassigned_count/length(tasks)*100);
+    
+    % Count completed tasks
+    completed_count = sum(auction_data.completion_status == 1);
+    fprintf('Completed tasks: %d (%.1f%%)\n', ...
+            completed_count, completed_count/length(tasks)*100);
+    
+    % Calculate workload by robot
+    fprintf('\nWorkload Distribution:\n');
+    fprintf('Robot\tTask Count\tExecution Time\tUtilization\n');
+    fprintf('------------------------------------------------------\n');
+    
+    % Calculate total execution time
+    total_execution_time = 0;
+    for i = 1:length(tasks)
+        if isfield(tasks, 'execution_time')
+            total_execution_time = total_execution_time + tasks(i).execution_time;
+        else
+            total_execution_time = total_execution_time + 1;  % Default execution time
+        end
+    end
+    
+    % Analyze robot workloads
+    max_workload = 0;
+    min_workload = inf;
+    
+    for robot_id = unique_robots'
+        robot_tasks = find(assignments == robot_id);
+        task_count = length(robot_tasks);
+        
+        % Calculate execution time for this robot
+        robot_execution_time = 0;
+        for i = 1:task_count
+            task_id = robot_tasks(i);
+            if isfield(tasks, 'execution_time')
+                robot_execution_time = robot_execution_time + tasks(task_id).execution_time;
+            else
+                robot_execution_time = robot_execution_time + 1;  % Default execution time
+            end
+        end
+        
+        % Update min/max workload
+        if robot_execution_time > max_workload
+            max_workload = robot_execution_time;
+        end
+        if robot_execution_time < min_workload
+            min_workload = robot_execution_time;
+        end
+        
+        % Calculate utilization percentage
+        if total_execution_time > 0
+            utilization = robot_execution_time / total_execution_time * 100;
+        else
+            utilization = 0;
+        end
+        
+        fprintf('%d\t%d\t\t%.2f\t\t%.1f%%\n', ...
+                robot_id, task_count, robot_execution_time, utilization);
+    end
+    
+    % Calculate workload imbalance
+    if length(unique_robots) > 1 && min_workload < inf
+        imbalance = (max_workload - min_workload) / max_workload * 100;
+        fprintf('\nWorkload imbalance: %.1f%%\n', imbalance);
+    end
+    
+    % Check for oscillating tasks
+    if isfield(auction_data, 'task_oscillation_count')
+        oscillating_tasks = find(auction_data.task_oscillation_count > 2);
+        if ~isempty(oscillating_tasks)
+            fprintf('\nTasks with high oscillation (>2 reassignments):\n');
+            for i = 1:length(oscillating_tasks)
+                task_id = oscillating_tasks(i);
+                fprintf('Task %d: %d reassignments\n', task_id, auction_data.task_oscillation_count(task_id));
+            end
+        end
+    end
+    
+    fprintf('\n');
+end
+
+function local_analyzeBidDistribution(auction_data, robots, tasks)
+    % ANALYZEENDDISTRIBUTION Analyze the distribution of bids
+    %
+    % Parameters:
+    %   auction_data - Auction data structure
+    %   robots - Array of robot structures
+    %   tasks - Array of task structures
+    
+    % Get bid data
+    bids = auction_data.bids;
+    
+    fprintf('\n--- Bid Distribution Analysis ---\n');
+    
+    % Calculate bid statistics
+    non_zero_bids = bids(bids > 0);
+    
+    if ~isempty(non_zero_bids)
+        mean_bid = mean(non_zero_bids);
+        min_bid = min(non_zero_bids);
+        max_bid = max(non_zero_bids);
+        std_bid = std(non_zero_bids);
+        
+        fprintf('Bid statistics:\n');
+        fprintf('  Mean: %.2f\n', mean_bid);
+        fprintf('  Min: %.2f\n', min_bid);
+        fprintf('  Max: %.2f\n', max_bid);
+        fprintf('  Std Dev: %.2f\n', std_bid);
+        
+        % Analyze bid spread for each task
+        fprintf('\nTasks with highest bid spread:\n');
+        fprintf('Task\tMin Bid\tMax Bid\tSpread\tAssigned\n');
+        fprintf('----------------------------------------------\n');
+        
+        task_spreads = zeros(length(tasks), 1);
+        
+        for i = 1:length(tasks)
+            task_bids = bids(:, i);
+            task_bids = task_bids(task_bids > 0);
+            
+            if length(task_bids) > 1
+                task_min = min(task_bids);
+                task_max = max(task_bids);
+                spread = task_max - task_min;
+                task_spreads(i) = spread;
+            else
+                task_spreads(i) = 0;
+            end
+        end
+        
+        % Sort tasks by spread
+        [sorted_spreads, sort_idx] = sort(task_spreads, 'descend');
+        
+        % Print top 5 tasks by spread
+        for i = 1:min(5, length(sort_idx))
+            task_id = sort_idx(i);
+            task_bids = bids(:, task_id);
+            task_bids = task_bids(task_bids > 0);
+            
+            if length(task_bids) > 1
+                task_min = min(task_bids);
+                task_max = max(task_bids);
+                spread = task_max - task_min;
+                
+                % Get assigned robot
+                assigned_robot = auction_data.assignment(task_id);
+                if assigned_robot == 0
+                    assigned = 'None';
+                else
+                    assigned = sprintf('%d', assigned_robot);
+                end
+                
+                fprintf('%d\t%.2f\t%.2f\t%.2f\t%s\n', ...
+                        task_id, task_min, task_max, spread, assigned);
+            end
+        end
+    else
+        fprintf('No bids have been placed yet.\n');
+    end
+    
+    fprintf('\n');
 end
