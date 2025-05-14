@@ -29,6 +29,7 @@ params.comm_delay = 0;        % Communication delay (in iterations)
 params.packet_loss_prob = 0;  % Probability of packet loss
 params.failure_time = inf;    % Time of robot failure (inf = no failure)
 params.failed_robot = [];     % Which robot fails
+params.time_step = 0.1;       % Time step for task execution simulation
 
 % Create a simulation environment
 env = env_utils.createEnvironment(4, 4);  % 4m x 4m workspace
@@ -89,9 +90,14 @@ end
 
 % Track iterations without changes for convergence detection
 unchanged_iterations = 0;
+completed_count_prev = 0;
+
+% Simulation time tracking
+simulation_time = 0;
 
 for iter = 1:max_iterations
     metrics.iterations = iter;
+    simulation_time = simulation_time + params.time_step;
     
     % Check for robot failure
     if iter == params.failure_time && ~isempty(params.failed_robot)
@@ -103,6 +109,17 @@ for iter = 1:max_iterations
         auction_data = auction_utils.initiateRecovery(auction_data, robots, tasks, params.failed_robot);
     end
     
+    % Update available tasks based on completed tasks
+    completed_tasks = find(auction_data.completion_status == 1);
+    if length(completed_tasks) > completed_count_prev
+        fprintf('New tasks completed. Updating available tasks...\n');
+        completed_count_prev = length(completed_tasks);
+    end
+    available_tasks = task_utils.findAvailableTasks(tasks, completed_tasks);
+    
+    % Reset prices for blocked tasks
+    auction_data = auction_utils.resetPricesForBlockedTasks(auction_data, tasks, available_tasks);
+    
     % Simulate one step of the distributed auction algorithm
     [auction_data, new_assignments, messages] = auction_utils.distributedAuctionStep(auction_data, robots, tasks, available_tasks, params);
     metrics.messages = metrics.messages + messages;
@@ -110,7 +127,7 @@ for iter = 1:max_iterations
     % Update visualization
     subplot(2, 3, [1, 4]);
     env_utils.visualizeEnvironment(env, robots, tasks, auction_data);
-    title(sprintf('Environment (Iteration %d)', iter));
+    title(sprintf('Environment (Iteration %d, Time: %.1f s)', iter, simulation_time));
     
     % Update metrics
     metrics.price_history(:, iter) = auction_data.prices;
@@ -122,7 +139,7 @@ for iter = 1:max_iterations
         metrics.convergence_history(iter) = conv_metric;
         
         % Update unchanged iterations counter
-        if conv_metric == 0
+        if conv_metric == 0 && sum(auction_data.completion_status) == completed_count_prev
             unchanged_iterations = unchanged_iterations + 1;
         else
             unchanged_iterations = 0;
@@ -132,29 +149,57 @@ for iter = 1:max_iterations
         unchanged_iterations = 0;
     end
     
-    % Check if any new tasks become available due to completed prerequisites
-    completed_tasks = find(auction_data.completion_status == 1);
-    available_tasks = task_utils.findAvailableTasks(tasks, completed_tasks);
-    
-    % Check for convergence - more stringent criteria
-    if iter > 20 && unchanged_iterations >= 15 && all(available_tasks <= length(tasks))
-        converged = true;
-        fprintf('Auction algorithm converged after %d iterations (stable for %d iterations)\n', ...
-            iter, unchanged_iterations);
-        break;
+    % Update other plots
+    if iter > 1
+        % Price history
+        subplot(2, 3, 2);
+        env_utils.plotTaskPrices(metrics.price_history(:, 1:iter));
+        title('Task Prices Over Time');
+        
+        % Assignment history
+        subplot(2, 3, 3);
+        env_utils.plotAssignments(metrics.assignment_history(:, 1:iter), length(robots));
+        title('Task Assignments Over Time');
+        
+        % Convergence metric
+        subplot(2, 3, 5);
+        env_utils.plotConvergence(metrics.convergence_history(1:iter));
+        title('Convergence Metric');
+        
+        % Workload distribution
+        subplot(2, 3, 6);
+        env_utils.plotWorkload(metrics.assignment_history(:, iter), tasks, robots);
+        title('Current Workload Distribution');
     end
     
-    % Additional convergence check - all tasks assigned
-    if all(auction_data.assignment > 0) && unchanged_iterations >= 5
+    % Check for convergence - enhanced criteria
+    if iter > 20 && unchanged_iterations >= 15
+        % Check if all available tasks are assigned
+        unassigned_available = sum(ismember(available_tasks, find(auction_data.assignment == 0)));
+        
+        if unassigned_available == 0
+            converged = true;
+            fprintf('Auction algorithm converged: all available tasks assigned (stable for %d iterations)\n', unchanged_iterations);
+            break;
+        elseif unchanged_iterations >= 30
+            converged = true;
+            fprintf('Auction algorithm converged with %d unassigned available tasks (stable for %d iterations)\n', unassigned_available, unchanged_iterations);
+            break;
+        end
+    end
+    
+    % Additional convergence check - all tasks completed or assigned
+    completed_and_assigned = sum(auction_data.completion_status == 1 | auction_data.assignment > 0);
+    if completed_and_assigned == length(tasks) && unchanged_iterations >= 5
         converged = true;
-        fprintf('Auction algorithm converged after %d iterations (all tasks assigned)\n', iter);
+        fprintf('Auction algorithm converged: all tasks completed or assigned\n');
         break;
     end
     
     % Update recovery time if in recovery mode
     if ~isempty(params.failed_robot) && metrics.failure_time > 0 && iter > metrics.failure_time && metrics.recovery_time == 0
         % Check if all tasks have been reassigned
-        if all(auction_data.assignment(auction_data.assignment == params.failed_robot) == 0)
+        if all(auction_data.assignment(auction_data.initial_assignment == params.failed_robot) ~= params.failed_robot)
             metrics.recovery_time = iter - metrics.failure_time;
             fprintf('Recovery completed after %d iterations\n', metrics.recovery_time);
         end
@@ -163,6 +208,21 @@ for iter = 1:max_iterations
     % Diagnostics every 10 iterations
     if mod(iter, 10) == 0
         auction_utils.analyzeTaskAllocation(auction_data, tasks);
+        
+        % Check progress of task completion
+        num_completed = sum(auction_data.completion_status);
+        num_assigned = sum(auction_data.assignment > 0 & auction_data.completion_status == 0);
+        fprintf('Progress: %d/%d tasks completed, %d tasks in progress\n', ...
+                num_completed, length(tasks), num_assigned);
+        
+        % Print detailed status
+        auction_utils.printTaskStatus(auction_data, tasks, robots);
+    end
+    
+    % Break if we go too long without progress
+    if iter > 50 && unchanged_iterations > 30
+        fprintf('Auction algorithm terminated - no progress after %d iterations\n', unchanged_iterations);
+        break;
     end
     
     % Pause for visualization
@@ -190,7 +250,7 @@ subplot(2, 3, 6);
 env_utils.plotWorkload(metrics.assignment_history(:, end), tasks, robots);
 title('Final Workload Distribution');
 
-% Calculate optimality gap - fixed to use absolute value
+% Calculate optimality gap
 optimal_makespan = robot_utils.calculateOptimalMakespan(tasks, robots);
 achieved_makespan = robot_utils.calculateMakespan(auction_data.assignment, tasks, robots);
 metrics.optimality_gap = abs(achieved_makespan - optimal_makespan);

@@ -4,7 +4,8 @@ function utils = robot_utils()
         'createRobots', @local_createRobots, ...
         'calculateMakespan', @local_calculateMakespan, ...
         'calculateOptimalMakespan', @local_calculateOptimalMakespan, ...
-        'updateRobotWorkload', @local_updateRobotWorkload ...
+        'updateRobotWorkload', @local_updateRobotWorkload, ...
+        'updateRobotCompletedTasks', @local_updateRobotCompletedTasks ...
     );
 end
 
@@ -41,6 +42,10 @@ function robots = local_createRobots(num_robots, env)
         
         robots(i).workload = 0;
         robots(i).failed = false;
+        
+        % ADDITION: Initialize tracking of assigned and completed tasks
+        robots(i).assigned_tasks = [];
+        robots(i).completed_tasks = [];
     end
     
     % Print capabilities for diagnostics
@@ -240,20 +245,6 @@ function makespan = local_calculateOptimalMakespan(tasks, robots)
         critical_path_length = max(critical_path_length, path_length);
     end
     
-    % IMPROVED: Better handling of task dependencies
-    % Analyze strongly connected components in the task graph
-    dependency_graph = zeros(length(tasks));
-    
-    for i = 1:length(tasks)
-        if isfield(tasks, 'prerequisites') && ~isempty(tasks(i).prerequisites)
-            for prereq = tasks(i).prerequisites
-                if prereq <= length(tasks)
-                    dependency_graph(prereq, i) = 1;
-                end
-            end
-        end
-    end
-    
     % The optimal makespan can't be less than either the balanced makespan,
     % the longest task, or the critical path length
     makespan = max([balanced_makespan, max_task_time, critical_path_length]);
@@ -264,11 +255,43 @@ function robots = local_updateRobotWorkload(robots, old_assignment, new_assignme
     
     % If task was previously assigned, reduce workload for that robot
     if old_assignment > 0 && old_assignment <= length(robots)
-        robots(old_assignment).workload = robots(old_assignment).workload - task_time;
+        robots(old_assignment).workload = max(0, robots(old_assignment).workload - task_time);
+        
+        % ADDITION: Update assigned tasks list
+        if isfield(robots(old_assignment), 'assigned_tasks')
+            robots(old_assignment).assigned_tasks = setdiff(robots(old_assignment).assigned_tasks, task_index);
+        end
     end
     
     % Add workload to newly assigned robot
     if new_assignment > 0 && new_assignment <= length(robots)
         robots(new_assignment).workload = robots(new_assignment).workload + task_time;
+        
+        % ADDITION: Update assigned tasks list
+        if ~isfield(robots(new_assignment), 'assigned_tasks')
+            robots(new_assignment).assigned_tasks = [];
+        end
+        robots(new_assignment).assigned_tasks = union(robots(new_assignment).assigned_tasks, task_index);
+    end
+end
+
+function robots = local_updateRobotCompletedTasks(robots, task_id, robot_id)
+    % UPDATEROBOTCOMPLETEDTASKS Update robot's completed tasks list when a task is completed
+    if robot_id > 0 && robot_id <= length(robots)
+        % Initialize if not present
+        if ~isfield(robots(robot_id), 'completed_tasks')
+            robots(robot_id).completed_tasks = [];
+        end
+        
+        % Add to completed tasks
+        robots(robot_id).completed_tasks = [robots(robot_id).completed_tasks, task_id];
+        
+        % Remove from assigned tasks
+        if isfield(robots(robot_id), 'assigned_tasks')
+            robots(robot_id).assigned_tasks = setdiff(robots(robot_id).assigned_tasks, task_id);
+        end
+        
+        % Update workload to reflect completion
+        % Note: We don't directly modify workload here as it's already tracked separately
     end
 end

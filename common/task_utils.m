@@ -150,15 +150,39 @@ function available_tasks = local_findAvailableTasks(tasks, completed_tasks)
     available_tasks = [];
     
     for i = 1:length(tasks)
-        % IMPROVED: Check if task is already in completed_tasks, if so, skip it
-        if ismember(i, completed_tasks)
-            continue;
+        % FIXED: Only consider tasks that are not already completed
+        if ~ismember(i, completed_tasks)
+            % Check if task has prerequisites
+            if isfield(tasks(i), 'prerequisites') && ~isempty(tasks(i).prerequisites)
+                % Check if all prerequisites are completed
+                all_prereqs_completed = true;
+                
+                for j = 1:length(tasks(i).prerequisites)
+                    prereq = tasks(i).prerequisites(j);
+                    if ~ismember(prereq, completed_tasks)
+                        all_prereqs_completed = false;
+                        break;
+                    end
+                end
+                
+                % If all prerequisites completed, task is available
+                if all_prereqs_completed
+                    available_tasks = [available_tasks, i];
+                end
+            else
+                % Task has no prerequisites, so it's available
+                available_tasks = [available_tasks, i];
+            end
         end
-        
-        % Check if all prerequisites are completed
-        if isempty(tasks(i).prerequisites) || all(ismember(tasks(i).prerequisites, completed_tasks))
-            available_tasks = [available_tasks, i];
-        end
+    end
+    
+    % DEBUG: Print available tasks
+    if ~isempty(available_tasks)
+        fprintf('Available tasks: ');
+        fprintf('%d ', available_tasks);
+        fprintf('\n');
+    else
+        fprintf('No tasks available currently.\n');
     end
 end
 
