@@ -233,47 +233,29 @@ function [auction_data, new_assignments, messages] = local_distributedAuctionSte
 end
 
 function bid = local_calculateBid(robot, task, current_price, params)
-    % CALCULATEBID Calculate bid value for a task
+    % Fix the bid calculation formula
     
-    % FIXED: Only bid on valid tasks
-    if ~isfield(task, 'id') || task.id == 0
-        bid = 0;
-        return;
-    end
+    % Calculate capability match with proper normalization
+    capability_match = dot(robot.capabilities, task.capabilities_required) / ...
+                      (norm(robot.capabilities) * norm(task.capabilities_required));
     
-    % Calculate capability match
-    capability_match = dot(robot.capabilities, task.capabilities_required);
-    
-    % Calculate distance-based cost
+    % Calculate distance-based cost with exponential decay
     distance = norm(robot.position - task.position);
-    distance_cost = distance * params.alpha(3);
+    distance_cost = params.alpha(3) * (1 - exp(-distance/2));
     
-    % Calculate workload balancing factor
-    % FIXED: Better workload balancing 
-    workload_factor = 1 / (1 + robot.workload);
+    % Ensure workload factor is effective even at zero workload
+    workload_factor = params.alpha(2) / (1 + robot.workload);
     
-    % ADDITION: Consider task dependencies
-    dependency_bonus = 0;
-    if isfield(task, 'prerequisites') && ~isempty(task.prerequisites)
-        % Give bonus for tasks that extend existing work
-        for prereq_id = task.prerequisites
-            if isfield(robot, 'completed_tasks') && ismember(prereq_id, robot.completed_tasks)
-                dependency_bonus = params.alpha(5);
-                break;
-            end
-        end
-    end
-    
-    % Calculate bid value
+    % Calculate bid value with proper weighting
     bid = params.alpha(1) * capability_match + ...
-          params.alpha(2) * workload_factor - ...
+          workload_factor - ...
           distance_cost + ...
-          params.alpha(4) * (1 / task.execution_time) + ...
-          dependency_bonus;
+          params.alpha(4) * (1 / (task.execution_time + 0.1));
     
-    % If bid is less than current price plus epsilon, don't bid
-    if bid <= current_price + params.epsilon
-        bid = 0;
+    % Critically important: Remove the condition that prevents bidding
+    % Only ensure bid is at least equal to current price plus epsilon
+    if bid <= current_price
+        bid = current_price + params.epsilon;
     end
 end
 
@@ -329,13 +311,24 @@ function auction_data = local_initiateRecovery(auction_data, robots, tasks, fail
 end
 
 function auction_data = local_resetPricesForBlockedTasks(auction_data, tasks, available_tasks)
-    % RESETPRICESFORBLOCKEDTASKS Reset prices for tasks that are blocked by dependencies
-    % This helps avoid price inflation for unavailable tasks
+    % Reset prices for all tasks to encourage bidding
     
+    % Decrease prices for tasks that haven't received bids
     for i = 1:length(tasks)
-        % If task is not available and not completed, reset its price
-        if ~ismember(i, available_tasks) && auction_data.completion_status(i) == 0
-            auction_data.prices(i) = 0;
+        % If task is available but unassigned
+        if ismember(i, available_tasks) && auction_data.assignment(i) == 0
+            % Gradually decrease price to encourage bidding
+            auction_data.prices(i) = max(0, auction_data.prices(i) - 0.01);
+        end
+    end
+    
+    % Introduce minimum prices for high-priority tasks
+    if isfield(tasks, 'prerequisites')
+        for i = 1:length(tasks)
+            if ~isempty(tasks(i).prerequisites) && length(tasks(i).prerequisites) == 0
+                % Root tasks (no prerequisites) are high priority
+                auction_data.prices(i) = max(auction_data.prices(i), 0.01);
+            end
         end
     end
 end
@@ -354,7 +347,7 @@ function [metrics, converged] = local_runAuctionSimulation(params, env, robots, 
     metrics = struct();
     metrics.iterations = 0;
     metrics.messages = 0;
-    metrics.convergence_history = [];
+    metrics.convergence_history = zeros(1, 1000);  % FIXED: Pre-allocate with zeros
     metrics.price_history = zeros(length(tasks), 1000);  % Preallocate
     metrics.assignment_history = zeros(length(tasks), 1000);
     metrics.completion_time = 0;
@@ -404,7 +397,7 @@ function [metrics, converged] = local_runAuctionSimulation(params, env, robots, 
         simulation_time = simulation_time + params.time_step;
         
         % Check for robot failure
-        if iter == params.failure_time && ~isempty(params.failed_robot)
+        if isfield(params, 'failure_time') && iter == params.failure_time && ~isempty(params.failed_robot)
             fprintf('Robot %d has failed at iteration %d\n', params.failed_robot, iter);
             robots(params.failed_robot).failed = true;
             metrics.failure_time = iter;  % Store failure time in metrics
@@ -443,7 +436,7 @@ function [metrics, converged] = local_runAuctionSimulation(params, env, robots, 
                 unchanged_iterations = 0;
             end
         else
-            metrics.convergence_history(iter) = NaN;
+            metrics.convergence_history(iter) = 0;  % FIXED: Set first value to 0 instead of NaN
             unchanged_iterations = 0;
         end
         
@@ -457,7 +450,7 @@ function [metrics, converged] = local_runAuctionSimulation(params, env, robots, 
             local_printTaskStatus(auction_data, tasks, robots);
             
             % Update other plots
-            if iter > 1
+            if iter > 0  % FIXED: Changed from iter > 1 to iter > 0
                 % Price history
                 subplot(2, 3, 2);
                 env_utils.plotTaskPrices(metrics.price_history(:, 1:iter));
@@ -468,9 +461,16 @@ function [metrics, converged] = local_runAuctionSimulation(params, env, robots, 
                 env_utils.plotAssignments(metrics.assignment_history(:, 1:iter), length(robots));
                 title('Task Assignments Over Time');
                 
-                % Convergence metric
+                % Convergence metric - FIXED: Check for valid data range
                 subplot(2, 3, 5);
-                env_utils.plotConvergence(metrics.convergence_history(1:iter));
+                if iter >= 1  % FIXED: Changed from iter > 1 to iter >= 1
+                    env_utils.plotConvergence(metrics.convergence_history(1:iter));
+                else
+                    % Create empty plot for first iteration
+                    plot(0, 0);
+                    xlim([0, 10]);
+                    ylim([0, 1]);
+                end
                 title('Convergence Metric');
                 
                 % Workload distribution
@@ -510,12 +510,14 @@ function [metrics, converged] = local_runAuctionSimulation(params, env, robots, 
         end
         
         % Update recovery time if in recovery mode
-        if auction_data.recovery_mode && metrics.recovery_time == 0
+        if isfield(auction_data, 'recovery_mode') && auction_data.recovery_mode && metrics.recovery_time == 0
             % Check if all tasks have been reassigned
-            tasks_to_reassign = find(auction_data.initial_assignment == auction_data.failed_robot);
-            if all(auction_data.assignment(tasks_to_reassign) ~= auction_data.failed_robot)
-                metrics.recovery_time = iter - metrics.failure_time;
-                fprintf('Recovery completed after %d iterations\n', metrics.recovery_time);
+            if isfield(auction_data, 'failed_robot') && ~isempty(auction_data.failed_robot)
+                tasks_to_reassign = find(auction_data.initial_assignment == auction_data.failed_robot);
+                if all(auction_data.assignment(tasks_to_reassign) ~= auction_data.failed_robot)
+                    metrics.recovery_time = iter - metrics.failure_time;
+                    fprintf('Recovery completed after %d iterations\n', metrics.recovery_time);
+                end
             end
         end
         
@@ -540,13 +542,13 @@ function [metrics, converged] = local_runAuctionSimulation(params, env, robots, 
     % Trim history matrices to actual size
     metrics.price_history = metrics.price_history(:, 1:iter);
     metrics.assignment_history = metrics.assignment_history(:, 1:iter);
+    metrics.convergence_history = metrics.convergence_history(1:iter);
     
     % Final analysis
     fprintf('\n--- Final Task Allocation ---\n');
     local_analyzeTaskAllocation(auction_data, tasks);
     
     % Calculate makespan
-    utils = utils_manager();
     robot_utils = utils.robot();
     metrics.makespan = robot_utils.calculateMakespan(auction_data.assignment, tasks, robots);
     metrics.optimal_makespan = robot_utils.calculateOptimalMakespan(tasks, robots);

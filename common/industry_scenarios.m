@@ -1442,11 +1442,11 @@ function [results] = local_runIndustrialScenario(scenario_type, difficulty_level
     
     % Set up auction parameters
     params = struct();
-    params.epsilon = 0.05;        % Minimum bid increment
-    params.alpha = [1.0, 0.5, 2.0, 0.8, 0.3];  % Bid calculation weights
-    params.gamma = 0.5;           % Consensus weight factor
+    params.epsilon = 0.02;        % Reduced from 0.05 to allow finer bidding
+    params.alpha = [2.0, 1.5, 0.5, 0.8, 0.3];  % Increased capability weight
+    params.gamma = 0.7;           % Increased from 0.5 for faster consensus
+    params.beta = [2.0, 1.5];     % Stronger recovery weights for failures
     params.lambda = 0.1;          % Information decay rate
-    params.beta = [1.5, 1.0];     % Recovery auction weights
     params.comm_delay = 0;        % Communication delay (in iterations)
     params.packet_loss_prob = 0;  % Probability of packet loss
     

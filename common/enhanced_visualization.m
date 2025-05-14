@@ -738,6 +738,34 @@ function local_visualizeRobotWorkspaces(robots, tasks, env, auction_data)
         end
     end
     
+    % Calculate assignment-aware distances for workspace visualization
+    for r = 1:length(robots)
+        assigned_tasks = find(auction_data.assignment == r);
+        
+        % Add assigned tasks as "attraction points" for workspace calculation
+        attraction_points = [robots(r).position];
+        for t = 1:length(assigned_tasks)
+            task_id = assigned_tasks(t);
+            attraction_points = [attraction_points; tasks(task_id).position];
+        end
+        
+        % Calculate distances based on minimum distance to any attraction point
+        for i = 1:length(y_range)
+            for j = 1:length(x_range)
+                grid_pos = [x_range(j), y_range(i)];
+                
+                % Calculate minimum distance to any attraction point
+                min_dist = inf;
+                for k = 1:size(attraction_points, 1)
+                    dist = norm(grid_pos - attraction_points(k, :));
+                    min_dist = min(min_dist, dist);
+                end
+                
+                workspace_costs(r, i, j) = min_dist;
+            end
+        end
+    end
+
     % Calculate optimal workspace allocation
     [min_cost, best_robot] = min(workspace_costs, [], 1);
     

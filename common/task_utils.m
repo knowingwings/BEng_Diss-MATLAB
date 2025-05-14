@@ -150,39 +150,47 @@ function available_tasks = local_findAvailableTasks(tasks, completed_tasks)
     available_tasks = [];
     
     for i = 1:length(tasks)
-        % FIXED: Only consider tasks that are not already completed
-        if ~ismember(i, completed_tasks)
-            % Check if task has prerequisites
-            if isfield(tasks(i), 'prerequisites') && ~isempty(tasks(i).prerequisites)
-                % Check if all prerequisites are completed
-                all_prereqs_completed = true;
-                
-                for j = 1:length(tasks(i).prerequisites)
-                    prereq = tasks(i).prerequisites(j);
-                    if ~ismember(prereq, completed_tasks)
-                        all_prereqs_completed = false;
-                        break;
-                    end
+        % Skip completed tasks
+        if ismember(i, completed_tasks)
+            continue;
+        end
+        
+        % Check prerequisites
+        prerequisites_met = true;
+        if isfield(tasks(i), 'prerequisites') && ~isempty(tasks(i).prerequisites)
+            for j = 1:length(tasks(i).prerequisites)
+                prereq = tasks(i).prerequisites(j);
+                if ~ismember(prereq, completed_tasks)
+                    prerequisites_met = false;
+                    break;
                 end
-                
-                % If all prerequisites completed, task is available
-                if all_prereqs_completed
-                    available_tasks = [available_tasks, i];
-                end
-            else
-                % Task has no prerequisites, so it's available
-                available_tasks = [available_tasks, i];
             end
+        end
+        
+        % If no prerequisites or all prerequisites are met, task is available
+        if prerequisites_met
+            available_tasks = [available_tasks, i];
         end
     end
     
-    % DEBUG: Print available tasks
-    if ~isempty(available_tasks)
-        fprintf('Available tasks: ');
-        fprintf('%d ', available_tasks);
-        fprintf('\n');
-    else
-        fprintf('No tasks available currently.\n');
+    % CRITICAL: Add at least one task if none are available
+    if isempty(available_tasks) && ~isempty(tasks)
+        % Find task with fewest prerequisites
+        min_prereqs = inf;
+        min_prereq_task = 1;
+        for i = 1:length(tasks)
+            if ~ismember(i, completed_tasks)
+                num_prereqs = 0;
+                if isfield(tasks(i), 'prerequisites')
+                    num_prereqs = length(tasks(i).prerequisites);
+                end
+                if num_prereqs < min_prereqs
+                    min_prereqs = num_prereqs;
+                    min_prereq_task = i;
+                end
+            end
+        end
+        available_tasks = [min_prereq_task];
     end
 end
 
