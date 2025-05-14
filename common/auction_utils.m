@@ -422,15 +422,6 @@ end
 
 function bid = local_calculateBid(robot, task, current_price, params)
     % CALCULATEBID Calculate bid value for a task
-    %
-    % Parameters:
-    %   robot - Robot structure
-    %   task - Task structure
-    %   current_price - Current price of the task
-    %   params - Algorithm parameters
-    %
-    % Returns:
-    %   bid - Calculated bid value
     
     % Calculate capability match with proper normalization
     capability_match = dot(robot.capabilities, task.capabilities_required) / ...
@@ -440,14 +431,15 @@ function bid = local_calculateBid(robot, task, current_price, params)
     distance = norm(robot.position - task.position);
     distance_cost = params.alpha(3) * (1 - exp(-distance/2));
     
-    % FIX: Improve workload factor calculation
+    % Improve workload factor calculation
     workload_factor = params.alpha(2) * (1 / (robot.workload + 1));
     
-    % IMPROVED: Add value for tasks on critical path and for tasks with dependencies
+    % FIXED: Add value for tasks on critical path and for tasks with dependencies
     critical_path_bonus = 0;
     dependency_bonus = 0;
     
-    if isfield(task, 'on_critical_path') && task.on_critical_path
+    % Use any() function to handle non-scalar logical values
+    if isfield(task, 'on_critical_path') && (isscalar(task.on_critical_path) && task.on_critical_path)
         critical_path_bonus = params.alpha(4) * 3;  % Triple importance for critical path tasks
     end
     
@@ -456,7 +448,7 @@ function bid = local_calculateBid(robot, task, current_price, params)
         dependency_bonus = params.alpha(5) * 2;
     end
     
-    % FIX: Add time efficiency factor - reward shorter tasks
+    % Add time efficiency factor - reward shorter tasks
     time_efficiency = 0;
     if isfield(task, 'execution_time') && task.execution_time > 0
         time_efficiency = params.alpha(4) * (5 / task.execution_time);
