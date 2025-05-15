@@ -4,10 +4,14 @@ function utils = task_utils()
         'createTasks', @local_createTasks, ...
         'addTaskDependencies', @local_addTaskDependencies, ...
         'findAvailableTasks', @local_findAvailableTasks, ...
-        'findTasksWithPrereqsInProgress', @local_findTasksWithPrereqsInProgress, ... % NEW FUNCTION
+        'findTasksWithPrereqsInProgress', @local_findTasksWithPrereqsInProgress, ...
         'calculateTaskCriticality', @local_calculateTaskCriticality, ...
         'calculateDependencyDepth', @local_calculateDependencyDepth, ...
-        'isOnCriticalPath', @local_isOnCriticalPath ...
+        'isOnCriticalPath', @local_isOnCriticalPath, ...
+        'calculateEarliestStartTime', @local_calculateEarliestStartTime, ...
+        'sortTasksByDependency', @local_sortTasksByDependency, ...
+        'calculateDependencyLevels', @local_calculateDependencyLevels, ...
+        'buildDependencyGraph', @local_buildDependencyGraph ...
     );
 end
 
@@ -52,17 +56,21 @@ function tasks = local_createTasks(num_tasks, env)
         % IMPROVED: More varied execution times based on capability pattern
         % Each pattern has a slightly different execution time distribution
         if pattern_idx == 1
-            tasks(i).execution_time = 3 + 2 * rand();  % 3-5 time units (REDUCED from original for faster execution)
+            tasks(i).execution_time = 3 + 2 * rand();  % 3-5 time units
         elseif pattern_idx == 2
-            tasks(i).execution_time = 4 + 2 * rand();  % 4-6 time units (REDUCED from original for faster execution)
+            tasks(i).execution_time = 4 + 2 * rand();  % 4-6 time units
         else
-            tasks(i).execution_time = 3 + 3 * rand();  % 3-6 time units (REDUCED from original for faster execution)
+            tasks(i).execution_time = 3 + 3 * rand();  % 3-6 time units
         end
         
         tasks(i).prerequisites = [];  % Will be filled in addTaskDependencies
         
         % NEW: Add task criticality flags (to be set later)
         tasks(i).on_critical_path = false;
+        
+        % NEW: Add planned start and end times
+        tasks(i).planned_start_time = 0;
+        tasks(i).planned_end_time = 0;
     end
 end
 
@@ -159,7 +167,26 @@ function tasks = local_addTaskDependencies(tasks, probability)
         end
     end
     
-    % IMPROVED: Ensure first task (chassis_positioning) has no prerequisites
+    % NEW: Calculate dependency levels for each task
+    dependency_levels = local_calculateDependencyLevels(tasks);
+    
+    % NEW: Set dependency level for each task
+    for i = 1:num_tasks
+        tasks(i).dependency_level = dependency_levels(i);
+    end
+    
+    % NEW: Find and mark the critical path
+    [critical_path, ~] = local_findCriticalPath(tasks);
+    
+    % Mark tasks on critical path
+    for i = 1:length(critical_path)
+        task_id = critical_path(i);
+        if task_id <= num_tasks
+            tasks(task_id).on_critical_path = true;
+        end
+    end
+    
+    % IMPROVED: Ensure first task (if has a specific name) has no prerequisites
     if ~isempty(tasks) && isfield(tasks, 'name') && strcmp(tasks(1).name, 'chassis_positioning')
         tasks(1).prerequisites = [];
     end
@@ -421,5 +448,292 @@ function is_critical = local_isOnCriticalPath(task_id, tasks)
     % IMPROVED: Directly check the on_critical_path flag if available
     if isfield(tasks(task_id), 'on_critical_path')
         is_critical = tasks(task_id).on_critical_path;
+    end
+end
+
+function earliest_start_time = local_calculateEarliestStartTime(task_id, tasks, completed_tasks, execution_times)
+    % CALCULATEEARLIESTSTARTIME Calculate the earliest possible start time for a task
+    %
+    % Parameters:
+    %   task_id - ID of the task
+    %   tasks - Array of task structures
+    %   completed_tasks - List of completed task IDs
+    %   execution_times - Array of execution times for each task
+    %
+    % Returns:
+    %   earliest_start_time - Earliest possible start time for the task
+    
+    % Initialize earliest start time to 0
+    earliest_start_time = 0;
+    
+    % Check if task has prerequisites
+    if isfield(tasks(task_id), 'prerequisites') && ~isempty(tasks(task_id).prerequisites)
+        for prereq = tasks(task_id).prerequisites
+            % Skip completed prerequisites
+            if ismember(prereq, completed_tasks)
+                continue;
+            end
+            
+            % For each uncompleted prerequisite, recursively find its earliest finish time
+            prereq_start_time = local_calculateEarliestStartTime(prereq, tasks, completed_tasks, execution_times);
+            prereq_finish_time = prereq_start_time + execution_times(prereq);
+            
+            % Update earliest start time
+            earliest_start_time = max(earliest_start_time, prereq_finish_time);
+        end
+    end
+end
+
+function sorted_tasks = local_sortTasksByDependency(tasks)
+    % SORTTASKSBYDEPENDENCY Sort tasks in order of dependency (topological sort)
+    %
+    % Parameters:
+    %   tasks - Array of task structures
+    %
+    % Returns:
+    %   sorted_tasks - Array of task IDs in dependency order
+    
+    num_tasks = length(tasks);
+    
+    % Calculate indegree (number of prerequisites) for each task
+    indegree = zeros(num_tasks, 1);
+    for i = 1:num_tasks
+        if isfield(tasks(i), 'prerequisites')
+            indegree(i) = length(tasks(i).prerequisites);
+        end
+    end
+    
+    % Start with tasks that have no prerequisites
+    queue = find(indegree == 0);
+    sorted_tasks = [];
+    
+    % Perform topological sort
+    while ~isempty(queue)
+        current = queue(1);
+        queue(1) = [];
+        
+        % Add to sorted list
+        sorted_tasks = [sorted_tasks, current];
+        
+        % For each task that depends on this one
+        for i = 1:num_tasks
+            if isfield(tasks(i), 'prerequisites') && ismember(current, tasks(i).prerequisites)
+                % Decrement indegree
+                indegree(i) = indegree(i) - 1;
+                
+                % If all prerequisites are processed, add to queue
+                if indegree(i) == 0
+                    queue = [queue, i];
+                end
+            end
+        end
+    end
+    
+    % Check for cycles
+    if length(sorted_tasks) < num_tasks
+        warning('Task dependency graph contains cycles. Some tasks were not sorted.');
+        
+        % Add remaining tasks
+        missing_tasks = setdiff(1:num_tasks, sorted_tasks);
+        sorted_tasks = [sorted_tasks, missing_tasks];
+    end
+end
+
+function levels = local_calculateDependencyLevels(tasks)
+    % CALCULATEDEPENDENCYLEVELS Calculate dependency level for each task
+    %
+    % Parameters:
+    %   tasks - Array of task structures
+    %
+    % Returns:
+    %   levels - Array of dependency levels (1 = no prerequisites, etc.)
+    
+    num_tasks = length(tasks);
+    levels = zeros(num_tasks, 1);
+    
+    % First calculate indegree (number of prerequisites) for each task
+    indegree = zeros(num_tasks, 1);
+    for i = 1:num_tasks
+        if isfield(tasks(i), 'prerequisites')
+            indegree(i) = length(tasks(i).prerequisites);
+        end
+    end
+    
+    % Initialize levels - tasks with no prerequisites are at level 1
+    levels(indegree == 0) = 1;
+    
+    % Calculate levels for remaining tasks using topological sort
+    queue = find(indegree == 0);
+    visited = false(num_tasks, 1);
+    
+    while ~isempty(queue)
+        current = queue(1);
+        queue(1) = [];
+        
+        if ~visited(current)
+            visited(current) = true;
+            
+            % Find tasks that depend on this task
+            for i = 1:num_tasks
+                if isfield(tasks(i), 'prerequisites') && ismember(current, tasks(i).prerequisites)
+                    % Update level if necessary
+                    levels(i) = max(levels(i), levels(current) + 1);
+                    
+                    % Decrement indegree
+                    indegree(i) = indegree(i) - 1;
+                    
+                    % Add to queue if all prerequisites have been processed
+                    if indegree(i) == 0
+                        queue = [queue, i];
+                    end
+                end
+            end
+        end
+    end
+    
+    % Handle any tasks not visited (potential circular dependencies)
+    if ~all(visited)
+        warning('Potential circular dependencies detected.');
+        unvisited = find(~visited);
+        levels(unvisited) = max(levels) + 1;
+    end
+end
+
+function graph = local_buildDependencyGraph(tasks)
+    % BUILDDEPENDENCYGRAPH Build a graph representation of task dependencies
+    %
+    % Parameters:
+    %   tasks - Array of task structures
+    %
+    % Returns:
+    %   graph - Structure containing adjacency matrix and other graph properties
+    
+    num_tasks = length(tasks);
+    
+    % Initialize adjacency matrix
+    adjacency = zeros(num_tasks, num_tasks);
+    
+    % Fill adjacency matrix based on prerequisites
+    for i = 1:num_tasks
+        if isfield(tasks(i), 'prerequisites') && ~isempty(tasks(i).prerequisites)
+            for prereq = tasks(i).prerequisites
+                if prereq <= num_tasks
+                    adjacency(prereq, i) = 1;  % Edge from prereq to i
+                end
+            end
+        end
+    end
+    
+    % Calculate indegree and outdegree
+    indegree = sum(adjacency, 1)';
+    outdegree = sum(adjacency, 2);
+    
+    % Find source and sink nodes
+    source_nodes = find(indegree == 0);
+    sink_nodes = find(outdegree == 0);
+    
+    % Create graph structure
+    graph = struct(...
+        'adjacency', adjacency, ...
+        'indegree', indegree, ...
+        'outdegree', outdegree, ...
+        'source_nodes', source_nodes, ...
+        'sink_nodes', sink_nodes, ...
+        'num_nodes', num_tasks ...
+    );
+    
+    % Calculate dependency levels
+    levels = local_calculateDependencyLevels(tasks);
+    graph.levels = levels;
+    
+    % Find critical path
+    [critical_path, ~] = local_findCriticalPath(tasks);
+    graph.critical_path = critical_path;
+end
+
+function [critical_path, task_depths] = local_findCriticalPath(tasks)
+    % FINDCRITICALPATH Find the critical path in the task dependency graph
+    %
+    % Parameters:
+    %   tasks - Array of task structures
+    %
+    % Returns:
+    %   critical_path - Array of task IDs on the critical path
+    %   task_depths - Depth of each task in the dependency graph
+    
+    num_tasks = length(tasks);
+    
+    % Initialize task depths
+    task_depths = zeros(1, num_tasks);
+    
+    % Calculate max path length to each task (depth)
+    for i = 1:num_tasks
+        if task_depths(i) == 0  % If not already calculated
+            task_depths(i) = calculateTaskDepth(i, tasks, task_depths);
+        end
+    end
+    
+    % Find the maximum depth (longest path)
+    [max_depth, max_depth_idx] = max(task_depths);
+    
+    % Trace back the critical path from the deepest task
+    critical_path = traceCriticalPath(max_depth_idx, tasks, task_depths);
+    
+    % Reverse the path to get start-to-end ordering
+    critical_path = fliplr(critical_path);
+end
+
+function depth = calculateTaskDepth(task_id, tasks, memo)
+    % Recursive function to calculate the maximum path length ending at this task
+    
+    % If already calculated, return memoized value
+    if memo(task_id) > 0
+        depth = memo(task_id);
+        return;
+    end
+    
+    % No prerequisites means depth of 1
+    if isempty(tasks(task_id).prerequisites)
+        depth = 1;
+    else
+        % Calculate max depth from prerequisites
+        max_prereq_depth = 0;
+        for i = 1:length(tasks(task_id).prerequisites)
+            prereq_id = tasks(task_id).prerequisites(i);
+            prereq_depth = calculateTaskDepth(prereq_id, tasks, memo);
+            max_prereq_depth = max(max_prereq_depth, prereq_depth);
+        end
+        depth = max_prereq_depth + 1;
+    end
+    
+    % Store in memoization table
+    memo(task_id) = depth;
+end
+
+function path = traceCriticalPath(end_task, tasks, task_depths)
+    % Trace the critical path from end to start
+    
+    path = end_task;
+    current = end_task;
+    
+    while ~isempty(tasks(current).prerequisites)
+        max_depth = 0;
+        max_prereq = 0;
+        
+        % Find prerequisite with maximum depth
+        for i = 1:length(tasks(current).prerequisites)
+            prereq_id = tasks(current).prerequisites(i);
+            if task_depths(prereq_id) > max_depth
+                max_depth = task_depths(prereq_id);
+                max_prereq = prereq_id;
+            end
+        end
+        
+        if max_prereq > 0
+            path = [max_prereq, path];
+            current = max_prereq;
+        else
+            break;
+        end
     end
 end
