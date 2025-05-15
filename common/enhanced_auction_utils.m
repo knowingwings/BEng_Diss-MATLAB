@@ -1,1122 +1,1181 @@
 function utils = enhanced_auction_utils()
     % ENHANCED_AUCTION_UTILS - Returns function handles for enhanced auction algorithm
-    % This file extends the original auction_utils with additional functionality
-    % based on the mathematical foundations document
+    utils = struct(...
+        'initializeAuctionData', @initializeAuctionData, ...
+        'enhancedDistributedAuctionStep', @enhancedDistributedAuctionStep, ...
+        'detectFailures', @detectFailures, ...
+        'initiateRecovery', @initiateRecovery, ...
+        'calculateBid', @calculateBid, ...
+        'handleCollaborativeTasks', @handleCollaborativeTasks, ...
+        'analyzeTaskAllocation', @analyzeTaskAllocation, ...
+        'analyzeBidDistribution', @analyzeBidDistribution, ...
+        'runEnhancedAuctionSimulation', @runEnhancedAuctionSimulation ...  % Add this line
+    );
     
-    % Get base utilities
-    base_utils = auction_utils();
-    
-    % Create enhanced utilities structure
-    utils = base_utils;
-    
-    % Override/add enhanced functions
-    utils.initializeAuctionData = @enhancedInitializeAuctionData;
-    utils.distributedAuctionStep = @enhancedDistributedAuctionStep;
-    utils.calculateEnhancedBid = @calculateEnhancedBid;
-    utils.detectFailures = @detectFailures;
-    utils.initiateRecovery = @enhancedRecovery;
-    utils.manageTaskDependencies = @manageTaskDependencies;
-    utils.handleCollaborativeTasks = @handleCollaborativeTasks;
-    utils.analyzeBidConvergence = @analyzeBidConvergence;
-    utils.runTimeWeightedConsensus = @runTimeWeightedConsensus;
-    utils.runAuctionSimulation = @runEnhancedAuctionSimulation;
-    
-    % Enhanced auction data initialization
-    function auction_data = enhancedInitializeAuctionData(tasks, robots)
-        % Start with base initialization
-        auction_data = base_utils.initializeAuctionData(tasks, robots);
+    % =========================================================================
+    function auction_data = initializeAuctionData(tasks, robots)
+        % INITIALIZEAUCTIONDATA Initializes the auction data structure
+        %
+        % Parameters:
+        %   tasks  - Array of task structures
+        %   robots - Array of robot structures
+        %
+        % Returns:
+        %   auction_data - Initialized auction data structure
         
-        % Add additional fields for enhanced algorithms
+        num_tasks = length(tasks);
+        num_robots = length(robots);
+        
+        % Standard auction data initialization
+        auction_data.prices = zeros(num_tasks, 1);  % Initial prices are zero
+        auction_data.assignment = zeros(num_tasks, 1);  % 0 means unassigned
+        auction_data.initial_assignment = zeros(num_tasks, 1);  % For recovery analysis
+        auction_data.completion_status = zeros(num_tasks, 1);  % 0 means incomplete
+        auction_data.bids = zeros(num_robots, num_tasks);  % Bid matrix
+        auction_data.utilities = zeros(num_robots, num_tasks);  % Utility matrix
+        auction_data.utility_iter = 1;  % Current iteration for utility history
+        
+        % Task tracking
+        auction_data.task_oscillation_count = zeros(num_tasks, 1);  % Count of assignment changes for each task
+        auction_data.task_last_robot = zeros(num_tasks, 1);  % Last robot assigned to each task
+        auction_data.unassigned_iterations = zeros(num_tasks, 1);  % Track how long tasks remain unassigned
+        
+        % Recovery mode tracking
+        auction_data.recovery_mode = false;  % Whether in recovery mode
+        auction_data.failure_assignment = [];  % Store assignment at time of failure
+        
+        % Collaborative task data
+        auction_data.collaborative_tasks = zeros(num_tasks, 1);
+        for i = 1:num_tasks
+            if isfield(tasks, 'collaborative') && any(tasks(i).collaborative)
+                auction_data.collaborative_tasks(i) = 1;
+            end
+        end
+        
+        % Initialize heartbeat data
+        auction_data.last_heartbeat = zeros(num_robots, 1);
+        auction_data.current_time = 1;  % Start at iteration 1
+        
+        % Set initial heartbeats for all robots (they're all alive at start)
+        for i = 1:num_robots
+            auction_data.last_heartbeat(i) = auction_data.current_time;
+        end
+        
+        % For tracking failure history
+        auction_data.failed_robots = zeros(num_robots, 1);
+        auction_data.failure_time = zeros(num_robots, 1);
+        auction_data.recovery_time = zeros(num_robots, 1);
+        
+        % For progress tracking (used in failure detection)
+        auction_data.task_progress = zeros(num_tasks, 1);
+        auction_data.last_progress_check = zeros(num_tasks, 1);
+        auction_data.last_progress_time = zeros(num_tasks, 1);
+        
+        % Historical data for diagnosis
+        auction_data.all_utilities = zeros(num_robots, num_tasks, 1000);  % Historical utilities
+        auction_data.last_update_time = zeros(num_robots, 1);  % For time-weighted consensus
+    end
+    
+    % =========================================================================
+    function [auction_data, new_assignments, messages] = enhancedDistributedAuctionStep(auction_data, robots, tasks, available_tasks, params, varargin)
+        % ENHANCEDDISTRIBUTEDAUCTIONSTEP Performs one step of the distributed auction algorithm
+        %
+        % Parameters:
+        %   auction_data    - Auction data structure
+        %   robots          - Array of robot structures
+        %   tasks           - Array of task structures
+        %   available_tasks - List of available task IDs
+        %   params          - Algorithm parameters
+        %   varargin        - Optional iteration number
+        %
+        % Returns:
+        %   auction_data    - Updated auction data structure
+        %   new_assignments - Whether any new assignments were made
+        %   messages        - Number of messages exchanged
+        
+        % Handle optional iter parameter for backward compatibility
+        if length(varargin) >= 1
+            iter = varargin{1};
+        else
+            iter = auction_data.utility_iter; % Use utility_iter as fallback
+        end
+
         num_robots = length(robots);
         num_tasks = length(tasks);
+        new_assignments = false;
+        messages = 0;
         
-        % Consensus protocol related fields
-        auction_data.state_vectors = cell(num_robots, 1);
+        % Update simulation time
+        auction_data.current_time = iter;
+        
+        % ---- HEARTBEAT MECHANISM ----
+        % Each active robot sends a heartbeat
         for i = 1:num_robots
-            % Format: [robot positions, task prices, task assignments, task completion]
-            auction_data.state_vectors{i} = zeros(2*num_robots + 2*num_tasks, 1);
-            
-            % Initialize with known information
-            % Robot positions
-            for r = 1:num_robots
-                auction_data.state_vectors{i}(2*(r-1)+1:2*r) = robots(r).position;
-            end
-            
-            % Task prices
-            auction_data.state_vectors{i}(2*num_robots+1:2*num_robots+num_tasks) = zeros(num_tasks, 1);
-            
-            % Task assignments
-            auction_data.state_vectors{i}(2*num_robots+num_tasks+1:2*num_robots+2*num_tasks) = zeros(num_tasks, 1);
-        end
-        
-        auction_data.consensus_errors = [];
-        auction_data.last_update_time = zeros(num_robots, num_robots);
-        
-        % Communication model related fields
-        auction_data.comm_delay = zeros(num_robots, num_robots);
-        auction_data.packet_loss_prob = zeros(num_robots, num_robots);
-        auction_data.comm_range = Inf * ones(num_robots, 1);
-        
-        % Failure detection related fields
-        auction_data.heartbeat_timestamps = zeros(num_robots, 1);
-        auction_data.progress_history = zeros(num_tasks, 10);  % Store last 10 progress values
-        auction_data.progress_rate = zeros(num_tasks, 1);
-        
-        % Task dependency related fields
-        auction_data.dependency_matrix = zeros(num_tasks, num_tasks);
-        for i = 1:num_tasks
-            if isfield(tasks, 'prerequisites') && ~isempty(tasks(i).prerequisites)
-                auction_data.dependency_matrix(tasks(i).prerequisites, i) = 1;
-            end
-        end
-        auction_data.critical_path = [];
-        
-        % Collaborative task related fields
-        auction_data.collaborative_tasks = false(num_tasks, 1);
-        auction_data.leader_assignment = zeros(num_tasks, 1);
-        auction_data.sync_status = zeros(num_tasks, 1);
-        auction_data.sync_start_time = zeros(num_tasks, 1);
-        auction_data.execution_start_time = zeros(num_tasks, 1);
-        
-        % Theoretical performance analysis fields
-        auction_data.utility_iter = 1;
-        
-        return;
-    end
-    
-    % Enhanced distributed auction step with consensus and collaboration
-    function [auction_data, new_assignments, messages] = enhancedDistributedAuctionStep(auction_data, robots, tasks, available_tasks, params)
-        % Run time-weighted consensus to maintain consistent global view
-        auction_data = runTimeWeightedConsensus(auction_data, robots, params);
-        
-        % Run the base auction step with enhanced bid calculation
-        [auction_data, new_assignments, messages] = base_utils.distributedAuctionStep(auction_data, robots, tasks, available_tasks, params);
-        
-        % Handle collaborative tasks if any
-        if any(auction_data.collaborative_tasks)
-            for j = find(auction_data.collaborative_tasks')
-                if auction_data.assignment(j) > 0 
-                    [auction_data, sync_successful] = handleCollaborativeTasks(auction_data, robots, j, params);
+            % Only send heartbeats from non-failed robots
+            if ~isfield(robots, 'failed') || ~robots(i).failed
+                % Simulate heartbeat message transmission
+                transmission_success = true;
+                
+                % Apply packet loss probability if specified
+                if isfield(params, 'packet_loss_prob') && params.packet_loss_prob > 0
+                    if rand() < params.packet_loss_prob
+                        transmission_success = false;
+                    end
+                end
+                
+                % If heartbeat was successfully transmitted, update timestamp
+                if transmission_success
+                    auction_data.last_heartbeat(i) = auction_data.current_time;
+                    messages = messages + 1; % Count heartbeat as a message
                 end
             end
         end
         
-        % Update task dependencies
-        completed_tasks = find(auction_data.completion_status == 1);
-        [auction_data, available_tasks] = manageTaskDependencies(auction_data, tasks, completed_tasks);
-        
-        return;
-    end
-    
-    % Enhanced bid calculation based on mathematical foundations
-    function bid = calculateEnhancedBid(robot_id, task_id, robot_workload, workload_ratio, auction_data, params, tasks, robots)
-        % Extract base factors
-        distance_factor = 0;
-        config_factor = 0;
-        capability_match = 0;
-        
-        % Try to extract position data for real distance calculation
-        try
-            distance = norm(robots(robot_id).position - tasks(task_id).position);
-            distance_factor = 1 / (1 + distance);  % Normalize with soft max
-        catch
-            % If positional data unavailable
-            distance_factor = 0.5;  % Default value
+        % Convert "in recovery" tasks to unassigned before bidding
+        recovery_tasks = find(auction_data.assignment == -1);
+        if ~isempty(recovery_tasks)
+            auction_data.assignment(recovery_tasks) = 0;
+            available_tasks = union(available_tasks, recovery_tasks);
         end
         
-        % Try to calculate configuration transition cost
-        try
-            if isfield(robots, 'configuration')
-                current_config = robots(robot_id).configuration;
-                target_config = getTargetConfiguration(robots(robot_id), tasks(task_id));
-                config_factor = 1 / (1 + norm(current_config - target_config));
+        % Calculate current workload for each robot
+        robot_workloads = zeros(1, num_robots);
+        for i = 1:num_robots
+            if isfield(robots, 'failed') && robots(i).failed
+                continue;
+            end
+            for j = 1:length(tasks)
+                if auction_data.assignment(j) == i
+                    if isfield(tasks, 'execution_time')
+                        try
+                            robot_workloads(i) = robot_workloads(i) + double(tasks(j).execution_time);
+                        catch
+                            robot_workloads(i) = robot_workloads(i) + 1;
+                        end
+                    else
+                        robot_workloads(i) = robot_workloads(i) + 1;
+                    end
+                end
+            end
+        end
+        
+        % Calculate min and max workloads and the difference - used for adaptive pricing
+        active_robots = [];
+        for i = 1:num_robots
+            if ~isfield(robots, 'failed') || ~robots(i).failed
+                active_robots = [active_robots, i];
+            end
+        end
+        
+        if ~isempty(active_robots)
+            active_workloads = robot_workloads(active_robots);
+            min_workload = min(active_workloads);
+            max_workload = max(active_workloads);
+            workload_diff = max_workload - min_workload;
+            
+            % Calculate workload imbalance
+            if max_workload > 0
+                workload_imbalance = workload_diff / max_workload;
             else
-                config_factor = 0.5; % Default
+                workload_imbalance = 0;
             end
-        catch
-            % If configuration data unavailable
-            config_factor = 0.5;  % Default value
-        end
-        
-        % Calculate capability match score
-        try
-            if isfield(robots, 'capabilities') && isfield(tasks, 'capabilities_required')
-                robot_capabilities = robots(robot_id).capabilities;
-                task_requirements = tasks(task_id).capabilities_required;
-                
-                % Normalize vectors
-                robot_cap_norm = robot_capabilities / norm(robot_capabilities);
-                task_cap_norm = task_requirements / norm(task_requirements);
-                
-                % Compute cosine similarity (normalized dot product)
-                capability_match = dot(robot_cap_norm, task_cap_norm);
-            else
-                capability_match = 0.5; % Default
-            end
-        catch
-            % If capability data unavailable
-            capability_match = 0.5;  % Default value
-        end
-        
-        % Calculate workload factor (penalize overloaded robots)
-        workload_factor = robot_workload * (workload_ratio^1.8);
-        
-        % Calculate energy consumption estimate
-        try
-            energy_factor = distance * 0.1;
-        catch
-            energy_factor = 0.3;  % Default value
-        end
-        
-        % Get weights
-        alpha = params.alpha;
-        
-        % Calculate bid
-        bid = alpha(1) * distance_factor + ...
-              alpha(2) * config_factor + ...
-              alpha(3) * capability_match - ...
-              alpha(4) * workload_factor - ...
-              alpha(5) * energy_factor;
-        
-        % Special handling for collaborative tasks
-        if isfield(auction_data, 'collaborative_tasks') && ...
-           length(auction_data.collaborative_tasks) >= task_id && ...
-           auction_data.collaborative_tasks(task_id)
-            % Apply collaborative task penalties/bonuses
-            % Add synchronization cost factor
-            sync_factor = 0.2;  % Default value
-            bid = bid - alpha(4) * sync_factor;
-        end
-        
-        % Handle tasks on critical path - boost priority
-        if isfield(auction_data, 'critical_path') && ...
-           ismember(task_id, auction_data.critical_path)
-            critical_path_bonus = 0.5;
-            bid = bid + critical_path_bonus;
-        end
-        
-        % Handle task dependencies - prioritize tasks that enable many others
-        if isfield(auction_data, 'dependency_matrix') && ...
-           size(auction_data.dependency_matrix, 1) >= task_id
-            dependency_count = sum(auction_data.dependency_matrix(task_id, :));
-            if dependency_count > 0
-                dependency_bonus = 0.1 * dependency_count;
-                bid = bid + dependency_bonus;
-            end
-        end
-        
-        % Add small random noise to break ties
-        bid = bid + 0.001 * rand();
-        
-        return;
-    end
-    
-    % Failure detection based on mathematical foundations
-    function [failures, auction_data] = detectFailures(auction_data, robots, params)
-        failures = false(size(robots));
-        num_robots = length(robots);
-        
-        % Get current time from params
-        if isfield(params, 'current_time')
-            current_time = params.current_time;
         else
-            current_time = auction_data.utility_iter;
+            min_workload = 0;
+            max_workload = 0;
+            workload_diff = 0;
+            workload_imbalance = 0;
         end
         
-        % 1. Explicit detection via heartbeats
-        for i = 1:num_robots
-            if ~robots(i).failed
-                % Update heartbeat for active robots
-                auction_data.heartbeat_timestamps(i) = current_time;
+        % UPDATE: Track unassigned iterations counter for all tasks
+        for j = 1:length(tasks)
+            if auction_data.assignment(j) == 0
+                auction_data.unassigned_iterations(j) = auction_data.unassigned_iterations(j) + 1;
+            else
+                auction_data.unassigned_iterations(j) = 0;
             end
         end
         
-        % Check for missing heartbeats
-        if isfield(params, 'heartbeat_interval') && isfield(params, 'missed_heartbeat_threshold')
-            heartbeat_threshold = params.heartbeat_interval * params.missed_heartbeat_threshold;
-            for i = 1:num_robots
-                if ~robots(i).failed && (current_time - auction_data.heartbeat_timestamps(i) > heartbeat_threshold)
-                    % No heartbeat received for too long
-                    failures(i) = true;
-                end
-            end
+        % Adaptive epsilon based on iteration
+        if auction_data.utility_iter < 10
+            base_epsilon = params.epsilon * 1.5; % Higher initial epsilon to prevent oscillations
+        else
+            base_epsilon = params.epsilon;
         end
         
-        % 2. Implicit detection via task progress
-        num_tasks = length(auction_data.assignment);
+        % Adaptive batch sizing based on multiple factors
+        if auction_data.utility_iter < 10
+            base_batch_size = ceil(length(available_tasks)/3); % More aggressive initially
+        else
+            base_batch_size = ceil(length(available_tasks)/5); % Base batch size
+        end
+        
+        % Adjust batch size based on workload imbalance
+        if workload_imbalance > 0.3
+            imbalance_factor = 1.5; % Larger batches when imbalance is high
+        elseif workload_imbalance > 0.15
+            imbalance_factor = 1.25;
+        else
+            imbalance_factor = 1.0;
+        end
+        
+        % Adjust batch size based on unassigned tasks
+        unassigned_count = sum(auction_data.assignment == 0);
+        if unassigned_count > 0
+            unassigned_factor = 1 + (unassigned_count / length(tasks)) * 0.5;
+        else
+            unassigned_factor = 1.0;
+        end
+        
+        % Calculate final batch size
+        max_bids_per_iteration = max(2, ceil(base_batch_size * imbalance_factor * unassigned_factor));
+        
+        % Prevent excessive batching
+        max_bids_per_iteration = min(max_bids_per_iteration, length(available_tasks));
+        
+        % For each robot that is not failed
         for i = 1:num_robots
-            if robots(i).failed || failures(i)
-                continue;  % Skip already failed robots
+            if isfield(robots, 'failed') && robots(i).failed
+                continue;
             end
             
-            % Check tasks assigned to this robot
-            robot_tasks = find(auction_data.assignment == i);
-            if isempty(robot_tasks)
-                continue;  % No tasks assigned
+            % Adjust bid calculation based on workload relative to others
+            workload_ratio = 1.0;
+            if max_workload > 0
+                workload_ratio = robot_workloads(i) / max_workload;
             end
             
-            % Get progress history for these tasks
-            progress_stalled = false;
-            for j = robot_tasks
-                if j > size(auction_data.progress_history, 1)
-                    continue;
+            % Calculate bids for all available tasks
+            for j = available_tasks
+                % Check if this is a collaborative task
+                if auction_data.collaborative_tasks(j) == 1
+                    % Handle collaborative tasks differently
+                    [auction_data, sync_successful] = handleCollaborativeTasks(auction_data, robots, tasks, j, params);
+                    if sync_successful
+                        continue; % Skip normal bidding process for this task
+                    end
                 end
                 
-                % Shift history and add new progress
-                auction_data.progress_history(j, 1:end-1) = auction_data.progress_history(j, 2:end);
-                auction_data.progress_history(j, end) = auction_data.completion_status(j);
+                % Calculate bid with enhanced global objective consideration
+                single_bid = calculateBid(i, j, robot_workloads(i), workload_ratio, workload_imbalance, auction_data, params, iter);
                 
-                % Calculate progress rate
-                if size(auction_data.progress_history, 2) >= 3
-                    recent_progress = auction_data.progress_history(j, end) - auction_data.progress_history(j, end-3);
-                    auction_data.progress_rate(j) = recent_progress;
-                    
-                    % Check if progress has stalled
-                    if isfield(params, 'min_progress_rate') && recent_progress < params.min_progress_rate
-                        progress_stalled = true;
+                % Ensure bid is a scalar
+                auction_data.bids(i, j) = single_bid;
+                auction_data.utilities(i, j) = single_bid - auction_data.prices(j);
+                
+                % Apply a penalty to the utility if this task has recently oscillated between robots
+                if auction_data.task_oscillation_count(j) > 3 && auction_data.task_last_robot(j) ~= i
+                    auction_data.utilities(i, j) = auction_data.utilities(i, j) * 0.9;
+                end
+                
+                % ADD: Special handling for long-unassigned tasks with escalating incentives
+                if auction_data.assignment(j) == 0
+                    unassigned_iter = auction_data.unassigned_iterations(j);
+                    if unassigned_iter > 20
+                        bonus_factor = min(3.0, 1.0 + (unassigned_iter - 20) * 0.1);
+                        auction_data.utilities(i, j) = auction_data.utilities(i, j) * bonus_factor;
                     end
                 end
             end
             
-            % If progress has stalled on all tasks, suspect failure
-            if progress_stalled
-                failures(i) = true;
+            % Store utilities for diagnosis
+            if auction_data.utility_iter < size(auction_data.all_utilities, 3)
+                auction_data.all_utilities(i, :, auction_data.utility_iter) = auction_data.utilities(i, :);
+            end
+            
+            % Sort tasks by utility
+            [sorted_utilities, sorted_indices] = sort(auction_data.utilities(i, available_tasks), 'descend');
+            sorted_tasks = available_tasks(sorted_indices);
+            
+            % Select best tasks with positive utility - limited by batch size
+            bid_count = 0;
+            for j = sorted_tasks
+                if auction_data.utilities(i, j) > 0 && auction_data.assignment(j) ~= i
+                    % Message prioritization and persistence
+                    % Implement resend attempts based on packet loss probability
+                    resend_attempts = 0;
+                    if isfield(params, 'packet_loss_prob') && params.packet_loss_prob > 0
+                        resend_attempts = min(2, ceil(3 * params.packet_loss_prob));
+                    end
+                    sent_successfully = false;
+                    
+                    for attempt = 1:(resend_attempts+1)
+                        if ~isfield(params, 'packet_loss_prob') || params.packet_loss_prob == 0 || rand() > params.packet_loss_prob
+                            sent_successfully = true;
+                            break;
+                        end
+                        % In a real system, a small delay would occur between retries
+                    end
+                    
+                    if sent_successfully
+                        % Broadcast bid
+                        old_assignment = auction_data.assignment(j);
+                        
+                        % Track oscillation (robot changes) for this task
+                        if old_assignment > 0 && old_assignment ~= i
+                            auction_data.task_oscillation_count(j) = auction_data.task_oscillation_count(j) + 1;
+                        end
+                        auction_data.task_last_robot(j) = i;
+                        
+                        auction_data.assignment(j) = i;
+                        
+                        % Dynamic price increment with multiple factors
+                        effective_epsilon = base_epsilon;
+                        
+                        % Factor 1: Task oscillation history
+                        if auction_data.task_oscillation_count(j) > 2
+                            effective_epsilon = effective_epsilon * (1 + 0.15 * auction_data.task_oscillation_count(j));
+                        end
+                        
+                        % Factor 2: Workload balancing
+                        if workload_diff > 0
+                            if workload_ratio > 1.2  % Robot has >20% more workload than minimum
+                                effective_epsilon = effective_epsilon * 1.5;  % Increase price faster
+                            elseif workload_ratio < 0.8  % Robot has <80% of maximum workload
+                                effective_epsilon = effective_epsilon * 0.7;  % Increase price slower
+                            end
+                        end
+                        
+                        % Cap prices to prevent them from getting too high
+                        max_price = 3.0 * max(params.alpha); % Maximum reasonable price
+                        if auction_data.prices(j) + effective_epsilon > max_price
+                            effective_epsilon = max(0, max_price - auction_data.prices(j));
+                        end
+                        
+                        % Use the adjusted epsilon for price increment
+                        auction_data.prices(j) = auction_data.prices(j) + effective_epsilon;
+                        
+                        new_assignments = true;
+                        messages = messages + 1;
+                        
+                        % If this is the first assignment, record it for recovery analysis
+                        if auction_data.initial_assignment(j) == 0
+                            auction_data.initial_assignment(j) = i;
+                        end
+                        
+                        bid_count = bid_count + 1;
+                        if bid_count >= max_bids_per_iteration
+                            break;  % Limit bids per iteration for more uniform communication
+                        end
+                    end
+                end
             end
         end
         
-        % 3. Scheduled failures for simulation
-        if isfield(params, 'failure_time') && isfield(params, 'failed_robot')
-            if params.failure_time == current_time && ~isempty(params.failed_robot)
-                failures(params.failed_robot) = true;
+        % Progressive price reduction for unassigned tasks
+        if iter > 10
+            unassigned_tasks = find(auction_data.assignment == 0);
+            
+            if ~isempty(unassigned_tasks)
+                % Sort by how long they've been unassigned
+                [sorted_unassigned_times, sort_idx] = sort(auction_data.unassigned_iterations(unassigned_tasks), 'descend');
+                sorted_unassigned_tasks = unassigned_tasks(sort_idx);
+                
+                for task_idx = 1:length(sorted_unassigned_tasks)
+                    j = sorted_unassigned_tasks(task_idx);
+                    unassigned_iter = auction_data.unassigned_iterations(j);
+                    
+                    % Progressive price reduction - more aggressive for longer unassigned tasks
+                    if unassigned_iter > 30
+                        reduction_factor = 0.3; % Very aggressive reduction
+                    elseif unassigned_iter > 20
+                        reduction_factor = 0.5; % Strong reduction
+                    elseif unassigned_iter > 10
+                        reduction_factor = 0.7; % Moderate reduction
+                    else
+                        reduction_factor = 0.9; % Mild reduction
+                    end
+                    
+                    auction_data.prices(j) = auction_data.prices(j) * reduction_factor;
+                    
+                    % Ensure price doesn't go below zero
+                    auction_data.prices(j) = max(0, auction_data.prices(j));
+                    
+                    % Clear oscillation history to allow fresh bidding
+                    if unassigned_iter > 15
+                        auction_data.task_oscillation_count(j) = 0;
+                    end
+                    
+                    % Add status updates for difficult tasks to track progress
+                    if unassigned_iter > 25 && mod(iter, 5) == 0
+                        fprintf('Task %d remains unassigned for %d iterations - price reduced to %.2f\n', ...
+                                j, unassigned_iter, auction_data.prices(j));
+                    end
+                end
             end
         end
         
-        return;
+        % Update utility iteration counter
+        auction_data.utility_iter = auction_data.utility_iter + 1;
+        
+        % Update last update time for all robots
+        auction_data.last_update_time = auction_data.last_update_time + 1;
     end
     
-    % Enhanced recovery mechanism based on mathematical foundations
-    function [auction_data, recovered] = enhancedRecovery(auction_data, robots, tasks, failed_robot_id, params)
-        % Start with the base recovery
-        auction_data = base_utils.initiateRecovery(auction_data, robots, tasks, failed_robot_id);
+    % =========================================================================
+    function [failures, auction_data] = detectFailures(auction_data, robots, params)
+        % DETECTFAILURES Detects robot failures using multiple methods
+        %
+        % Parameters:
+        %   auction_data - Auction data structure
+        %   robots       - Array of robot structures
+        %   params       - Algorithm parameters
+        %
+        % Returns:
+        %   failures     - List of newly detected failed robot IDs
+        %   auction_data - Updated auction data structure
         
-        % Get tasks assigned to the failed robot
-        failed_tasks = find(auction_data.failure_assignment == failed_robot_id);
-        num_failed_tasks = length(failed_tasks);
+        failures = [];
         
-        % Calculate theoretical recovery bound
-        b_max = max(params.alpha);
-        epsilon = params.epsilon;
-        auction_data.recovery_bound = num_failed_tasks + round(b_max / epsilon);
+        % Don't detect failures during warm-up period to avoid false positives
+        if ~isfield(params, 'warmup_iterations')
+            params.warmup_iterations = 10; % Default warm-up period
+        end
         
-        % Enhanced recovery prioritization
-        if ~isempty(failed_tasks)
-            % Calculate criticality for each task
-            criticality_scores = zeros(num_failed_tasks, 1);
+        if auction_data.current_time < params.warmup_iterations
+            return;
+        end
+        
+        % Set default heartbeat timeout if not specified
+        if ~isfield(params, 'heartbeat_timeout')
+            params.heartbeat_timeout = 5; % Default timeout in iterations
+        end
+        
+        % Check heartbeats for each robot
+        for i = 1:length(robots)
+            % Skip already failed robots
+            if isfield(robots, 'failed') && robots(i).failed
+                continue;
+            end
             
-            for i = 1:num_failed_tasks
-                task_id = failed_tasks(i);
+            % Calculate time since last heartbeat
+            heartbeat_age = auction_data.current_time - auction_data.last_heartbeat(i);
+            
+            % For debugging - uncomment if needed
+            % fprintf('Iteration %d: Robot %d heartbeat age: %.2f (threshold: %.2f)\n', ...
+            %        auction_data.current_time, i, heartbeat_age, params.heartbeat_timeout);
+            
+            % Check if heartbeat timeout has occurred
+            if heartbeat_age > params.heartbeat_timeout
+                fprintf('Robot %d has failed at iteration %d (heartbeat timeout)\n', ...
+                       i, auction_data.current_time);
                 
-                % 1. Factor: Execution time
+                % Record the failure
+                failures = [failures, i];
+                
+                % Mark the robot as failed if it has a 'failed' field
+                if isfield(robots, 'failed')
+                    robots(i).failed = true;
+                end
+                
+                % Record failure time for recovery tracking
+                auction_data.failed_robots(i) = 1;
+                auction_data.failure_time(i) = auction_data.current_time;
+            end
+        end
+        
+        % Secondary detection: Check task progress (only if enabled)
+        if isfield(params, 'enable_progress_detection') && params.enable_progress_detection
+            for j = 1:length(auction_data.task_progress)
+                % Only check assigned tasks that are in progress
+                robot_id = auction_data.assignment(j);
+                if robot_id > 0 && auction_data.completion_status(j) == 0
+                    
+                    % Calculate progress rate (assuming you have a progress field)
+                    if isfield(auction_data, 'task_progress') && isfield(auction_data, 'last_progress_check')
+                        current_progress = auction_data.task_progress(j);
+                        last_progress = auction_data.last_progress_check(j);
+                        time_delta = auction_data.current_time - auction_data.last_progress_time(j);
+                        
+                        if time_delta > 0
+                            recent_progress = (current_progress - last_progress) / time_delta;
+                            
+                            % Check if progress is below minimum acceptable rate
+                            if isfield(params, 'min_progress_rate') && any(recent_progress < params.min_progress_rate)
+                                % Task is stalled, might indicate robot failure
+                                if ~ismember(robot_id, failures) && ~robots(robot_id).failed
+                                    fprintf('Robot %d failure detected from lack of progress on task %d\n', ...
+                                           robot_id, j);
+                                    failures = [failures, robot_id];
+                                    
+                                    % Mark the robot as failed
+                                    if isfield(robots, 'failed')
+                                        robots(robot_id).failed = true;
+                                    end
+                                    
+                                    % Record failure time
+                                    auction_data.failed_robots(robot_id) = 1;
+                                    auction_data.failure_time(robot_id) = auction_data.current_time;
+                                end
+                            end
+                        end
+                        
+                        % Update progress tracking variables
+                        auction_data.last_progress_check(j) = current_progress;
+                        auction_data.last_progress_time(j) = auction_data.current_time;
+                    end
+                end
+            end
+        end
+        
+        % Only return failures that haven't been detected already
+        failures = setdiff(failures, find(auction_data.failed_robots));
+    end
+    
+    % =========================================================================
+    function [auction_data, recovery_status] = initiateRecovery(auction_data, robots, tasks, failed_robot_id)
+        % INITIATERECOVERY Initiate recovery process after a robot failure
+        %
+        % Parameters:
+        %   auction_data    - Auction data structure
+        %   robots          - Array of robot structures
+        %   tasks           - Array of task structures
+        %   failed_robot_id - ID of the failed robot
+        %
+        % Returns:
+        %   auction_data    - Updated auction data structure
+        %   recovery_status - Status code (1=success, 0=partial, -1=failure)
+        
+        % Initialize return status
+        recovery_status = 1; % 1 = success, 0 = partial success, -1 = cannot recover
+        
+        % Store current assignment state for recovery analysis
+        auction_data.recovery_mode = true;
+        auction_data.failure_assignment = auction_data.assignment;
+        
+        % Check if all robots are failed - critical edge case!
+        all_failed = true;
+        for i = 1:length(robots)
+            if ~isfield(robots, 'failed') || ~robots(i).failed
+                all_failed = false;
+                break;
+            end
+        end
+        
+        if all_failed
+            fprintf('WARNING: All robots have failed. Recovery not possible without intervention.\n');
+            recovery_status = -1;
+            
+            % Option 1: Emergency restoration of one robot (uncomment if desired)
+            % if length(robots) > 0
+            %     fprintf('Emergency restoration of Robot 1 to enable recovery\n');
+            %     robots(1).failed = false;
+            %     auction_data.failed_robots(1) = 0;
+            % end
+            
+            % Option 2: Just report the issue and return
+            return;
+        end
+        
+        % Find tasks assigned to the failed robot
+        failed_tasks = find(auction_data.assignment == failed_robot_id);
+        
+        % Prioritize critical tasks during recovery
+        if ~isempty(failed_tasks)
+            % Calculate criticality scores for failed tasks
+            criticality_scores = zeros(size(failed_tasks));
+            
+            for i = 1:length(failed_tasks)
+                task_idx = failed_tasks(i);
+                
+                % 1. Consider execution time
                 if isfield(tasks, 'execution_time')
-                    criticality_scores(i) = tasks(task_id).execution_time;
+                    criticality_scores(i) = tasks(task_idx).execution_time;
                 else
                     criticality_scores(i) = 1;
                 end
                 
-                % 2. Factor: Dependency count (how many tasks depend on this)
-                if isfield(auction_data, 'dependency_matrix') && ...
-                   size(auction_data.dependency_matrix, 1) >= task_id
-                    dependency_count = sum(auction_data.dependency_matrix(task_id, :));
-                    criticality_scores(i) = criticality_scores(i) + dependency_count * 2;
+                % 2. Add bonus for tasks with dependencies
+                if isfield(tasks, 'prerequisites')
+                    % Count how many other tasks depend on this one
+                    dependent_count = 0;
+                    for j = 1:length(tasks)
+                        if ismember(task_idx, tasks(j).prerequisites)
+                            dependent_count = dependent_count + 1;
+                        end
+                    end
+                    criticality_scores(i) = criticality_scores(i) + dependent_count * 2;
                 end
                 
-                % 3. Factor: Critical path membership
-                if isfield(auction_data, 'critical_path') && ...
-                   ismember(task_id, auction_data.critical_path)
+                % 3. Add bonus for collaborative tasks
+                if auction_data.collaborative_tasks(task_idx) == 1
                     criticality_scores(i) = criticality_scores(i) * 1.5;
                 end
-                
-                % 4. Factor: Completion status
-                completion = auction_data.completion_status(task_id);
-                criticality_scores(i) = criticality_scores(i) * (1 - completion) * 0.5;
             end
             
-            % Sort by criticality (highest first)
+            % Sort failed tasks by criticality (highest first)
             [~, critical_order] = sort(criticality_scores, 'descend');
-            prioritized_tasks = failed_tasks(critical_order);
+            prioritized_failed_tasks = failed_tasks(critical_order);
             
-            % Mark them for enhanced recovery auction
-            auction_data.recovery_tasks = prioritized_tasks;
-            auction_data.recovery_criticality = criticality_scores(critical_order);
+            % Reset oscillation counters for these tasks to avoid bias
+            auction_data.task_oscillation_count(failed_tasks) = 0;
             
-            % Reset oscillation counts and prices based on priority
-            for i = 1:length(prioritized_tasks)
-                task_id = prioritized_tasks(i);
-                priority_factor = 1 - (i-1)/length(prioritized_tasks);
+            for i = 1:length(prioritized_failed_tasks)
+                task_idx = prioritized_failed_tasks(i);
                 
-                % Aggressive price reset for high-priority tasks
+                % Mark as in recovery with priority level reflected in the price reset
+                % Most critical tasks get bigger price reductions for faster reassignment
+                priority_factor = 1 - (i-1)/length(prioritized_failed_tasks);
+                auction_data.assignment(task_idx) = -1;  % -1 indicates "in recovery"
+                
+                % More aggressive price reset for high-priority tasks
                 reset_factor = 0.3 * (1 + priority_factor);
-                auction_data.prices(task_id) = auction_data.prices(task_id) * reset_factor;
+                auction_data.prices(task_idx) = auction_data.prices(task_idx) * reset_factor;
+            end
+        end
+        
+        fprintf('Recovery initiated for robot %d. %d tasks need reassignment.\n', ...
+                failed_robot_id, length(failed_tasks));
+        
+        return;
+    end
+    
+    % =========================================================================
+    function bid = calculateBid(robot_id, task_id, robot_workload, workload_ratio, workload_imbalance, auction_data, params, iter)
+        % CALCULATEBID Calculate a robot's bid for a specific task
+        %
+        % Parameters:
+        %   robot_id          - Robot ID
+        %   task_id           - Task ID
+        %   robot_workload    - Current workload of the robot
+        %   workload_ratio    - Ratio of robot's workload to maximum workload
+        %   workload_imbalance - Global workload imbalance measure
+        %   auction_data      - Auction data structure
+        %   params            - Algorithm parameters
+        %   iter              - Current iteration number
+        %
+        % Returns:
+        %   bid               - Calculated bid value
+        
+        % Make sure we're working with scalar values
+        robot_id = double(robot_id(1));
+        task_id = double(task_id(1));
+        robot_workload = double(robot_workload(1));
+        
+        % Try to extract position data for real distance calculation
+        try
+            distance = 0;
+            if isfield(robots, 'position') && isfield(tasks, 'position')
+                distance = norm(robots(robot_id).position - tasks(task_id).position);
+            else
+                % Fallback to ID-based distance approximation
+                distance = abs(robot_id - task_id);
+            end
+        catch
+            % If that fails, use a fallback approach
+            distance = abs(robot_id - task_id);
+        end
+        
+        % Better distance factor normalization
+        d_factor = 1 / (1 + distance);
+        
+        % Configuration cost - keep simple
+        c_factor = 1;
+        
+        % Try to calculate real capability matching if possible
+        try
+            capability_match = 0.8;  % Default value
+            if isfield(robots, 'capabilities') && isfield(tasks, 'capabilities_required')
+                robot_cap = robots(robot_id).capabilities;
+                task_cap = tasks(task_id).capabilities_required;
                 
-                % Clear oscillation history
-                auction_data.task_oscillation_count(task_id) = 0;
+                % Normalize vectors to unit length
+                robot_cap_norm = robot_cap / norm(robot_cap);
+                task_cap_norm = task_cap / norm(task_cap);
+                
+                % Compute cosine similarity (normalized dot product)
+                capability_match = dot(robot_cap_norm, task_cap_norm);
+            end
+        catch
+            % If calculation fails, use a default value
+            capability_match = 0.8;
+        end
+        
+        % Progressive workload factor with stronger imbalance penalty
+        % This creates a non-linear penalty that increases more rapidly with workload
+        workload_factor = robot_workload / 10 * (workload_ratio^1.8);
+        
+        % Add global balance consideration
+        global_balance_factor = workload_imbalance * 0.5;
+        
+        % Simple energy factor
+        energy_factor = distance * 0.1;
+        
+        % Standard weights with better balance
+        alpha = [0.8, 0.3, 1.0, 1.2, 0.2];  % Default values
+        
+        % Override with provided parameters if available
+        if isfield(params, 'alpha') && length(params.alpha) >= 5
+            for i = 1:5
+                alpha(i) = params.alpha(i);
             end
         end
         
-        recovered = (num_failed_tasks > 0);
-        return;
-    end
-    
-    % Task dependency management based on mathematical foundations
-    function [auction_data, available_tasks] = manageTaskDependencies(auction_data, tasks, completed_tasks)
-        num_tasks = length(tasks);
+        % Adjust workload penalty when imbalance is high
+        adjusted_workload_alpha = alpha(4);
+        if workload_ratio > 1.2 || workload_ratio < 0.8
+            adjusted_workload_alpha = adjusted_workload_alpha * 1.5;  % 50% increase in penalty
+        end
         
-        % Update dependency matrix if needed
-        if ~isfield(auction_data, 'dependency_matrix') || ...
-           any(size(auction_data.dependency_matrix) ~= [num_tasks, num_tasks])
-            auction_data.dependency_matrix = zeros(num_tasks, num_tasks);
-            for i = 1:num_tasks
-                if isfield(tasks, 'prerequisites') && ~isempty(tasks(i).prerequisites)
-                    auction_data.dependency_matrix(tasks(i).prerequisites, i) = 1;
+        % Enhanced bonus for unassigned tasks with progressive scaling
+        task_unassigned_bonus = 0;
+        if auction_data.assignment(task_id) == 0
+            unassigned_iter = auction_data.unassigned_iterations(task_id);
+            
+            % Exponential bonus scaling for persistent unassigned tasks
+            if unassigned_iter > 25
+                task_unassigned_bonus = min(6.0, 0.5 * exp(unassigned_iter/10));
+            elseif unassigned_iter > 15
+                task_unassigned_bonus = min(4.0, 0.4 * exp(unassigned_iter/12));
+            elseif unassigned_iter > 5
+                task_unassigned_bonus = min(3.0, 0.3 * unassigned_iter);
+            end
+        end
+        
+        % Add scaling factor for tasks that need to be assigned quickly
+        iteration_factor = 0;
+        if iter > 20 && auction_data.assignment(task_id) == 0
+            iteration_factor = min(2.0, 0.05 * iter);
+        end
+        
+        % Calculate bid
+        if auction_data.recovery_mode
+            % Add recovery-specific terms when in recovery mode
+            % Extract beta parameters safely
+            beta = [2.0, 1.5, 1.0];  % Added third parameter for balance
+            if isfield(params, 'beta') && length(params.beta) >= 2
+                beta(1) = params.beta(1);
+                beta(2) = params.beta(2);
+                if length(params.beta) >= 3
+                    beta(3) = params.beta(3);
                 end
             end
-        end
-        
-        % Calculate earliest start times (forward pass)
-        earliest_start = zeros(num_tasks, 1);
-        earliest_finish = zeros(num_tasks, 1);
-        
-        % Topological sort to respect dependencies
-        visited = false(num_tasks, 1);
-        topo_order = [];
-        
-        for i = 1:num_tasks
-            if ~visited(i)
-                [visited, topo_order] = topologicalSort(i, visited, topo_order, auction_data.dependency_matrix);
-            end
-        end
-        
-        % Calculate earliest times based on topological order
-        for i = topo_order
-            % Find prerequisites
-            prereqs = find(auction_data.dependency_matrix(:, i));
             
-            if ~isempty(prereqs)
-                earliest_start(i) = max(earliest_finish(prereqs));
-            end
+            % Calculate bid components with improved recovery bias
+            progress_term = beta(1) * (1 - 0);  % Assuming no partial progress
+            criticality_term = beta(2) * 0.5;   % Default criticality
             
-            % Calculate finish time
-            if isfield(tasks, 'execution_time')
-                earliest_finish(i) = earliest_start(i) + tasks(i).execution_time;
-            else
-                earliest_finish(i) = earliest_start(i) + 1;  % Default
-            end
+            % Recovery bids favor robots with lower workload more strongly
+            recovery_workload_factor = (1 - workload_ratio) * beta(1) * 0.8;
+            
+            % Add stronger global balance factor during recovery
+            global_recovery_factor = workload_imbalance * beta(3) * 0.7;
+            
+            bid = alpha(1) * d_factor + ...
+                  alpha(2) * c_factor + ...
+                  alpha(3) * capability_match - ...
+                  adjusted_workload_alpha * workload_factor - ...
+                  alpha(5) * energy_factor + ...
+                  progress_term + ...
+                  criticality_term + ...
+                  recovery_workload_factor + ...
+                  global_recovery_factor + ...
+                  global_balance_factor + ...
+                  task_unassigned_bonus + ...
+                  iteration_factor;
+        else
+            bid = alpha(1) * d_factor + ...
+                  alpha(2) * c_factor + ...
+                  alpha(3) * capability_match - ...
+                  adjusted_workload_alpha * workload_factor - ...
+                  alpha(5) * energy_factor + ...
+                  global_balance_factor + ...
+                  task_unassigned_bonus + ...
+                  iteration_factor;
         end
         
-        % Calculate latest start times (backward pass)
-        latest_finish = max(earliest_finish) * ones(num_tasks, 1);
-        latest_start = zeros(num_tasks, 1);
-        
-        % Reverse topological order for backward pass
-        for i = fliplr(topo_order)
-            % Find tasks that depend on this one
-            dependents = find(auction_data.dependency_matrix(i, :));
-            
-            if ~isempty(dependents)
-                latest_finish(i) = min(latest_start(dependents));
-            end
-            
-            % Calculate latest start
-            if isfield(tasks, 'execution_time')
-                latest_start(i) = latest_finish(i) - tasks(i).execution_time;
-            else
-                latest_start(i) = latest_finish(i) - 1;  % Default
-            end
-        end
-        
-        % Calculate slack and identify critical path
-        slack = latest_start - earliest_start;
-        auction_data.critical_path = find(slack < 0.001);  % Near-zero slack
-        
-        % Find available tasks
-        available_tasks = [];
-        for i = 1:num_tasks
-            if auction_data.completion_status(i) == 0  % Not completed
-                % Check if all prerequisites are completed
-                prereqs = find(auction_data.dependency_matrix(:, i));
-                if all(ismember(prereqs, completed_tasks))
-                    available_tasks = [available_tasks, i];
-                end
-            end
-        end
-        
-        return;
+        % Add small random noise to break ties (slightly increased to help prevent cycling)
+        bid = double(bid) + 0.001 * rand();
     end
     
-    % Helper function for topological sort
-    function [visited, topo_order] = topologicalSort(node, visited, topo_order, dep_matrix)
-        visited(node) = true;
+    % =========================================================================
+    function [auction_data, sync_successful] = handleCollaborativeTasks(auction_data, robots, tasks, task_id, params)
+        % HANDLECOLLABORATIVETASKS Special handling for collaborative tasks requiring multiple robots
+        %
+        % Parameters:
+        %   auction_data - Auction data structure
+        %   robots       - Array of robot structures
+        %   tasks        - Array of task structures
+        %   task_id      - ID of the collaborative task
+        %   params       - Algorithm parameters
+        %
+        % Returns:
+        %   auction_data    - Updated auction data structure
+        %   sync_successful - Whether synchronization was successful
         
-        % Visit all dependencies first
-        for i = find(dep_matrix(node, :))
-            if ~visited(i)
-                [visited, topo_order] = topologicalSort(i, visited, topo_order, dep_matrix);
-            end
-        end
-        
-        % Add current node after all its dependencies
-        topo_order = [topo_order, node];
-    end
-    
-    % Collaborative task handling based on mathematical foundations
-    function [auction_data, sync_successful] = handleCollaborativeTasks(auction_data, robots, task_id, params)
+        % Default return value
         sync_successful = false;
         
+        % Verify this is actually a collaborative task
         if ~auction_data.collaborative_tasks(task_id)
-            % Not a collaborative task
-            sync_successful = true;
             return;
         end
         
-        % Get the two robots
+        % For a two-robot system, we need both robots to be available
+        if length(robots) < 2
+            return;
+        end
+        
+        % Skip if either robot has failed
+        if (isfield(robots, 'failed') && (robots(1).failed || robots(2).failed))
+            return;
+        end
+        
+        % For simplicity, we refer to them as robot1 and robot2
         robot1 = 1;
         robot2 = 2;
         
-        % Skip if either robot has failed
-        if robots(robot1).failed || robots(robot2).failed
+        % Determine leader/follower roles
+        % Calculate leader cost for each robot
+        cost1 = calculateLeaderCost(robot1, task_id, robots, tasks, auction_data);
+        cost2 = calculateLeaderCost(robot2, task_id, robots, tasks, auction_data);
+        
+        % Lower cost means better suited as leader
+        if cost1 <= cost2
+            leader = robot1;
+            follower = robot2;
+        else
+            leader = robot2;
+            follower = robot1;
+        end
+        
+        % Calculate joint bid
+        leader_bid = calculateBid(leader, task_id, robot_workload(leader), workload_ratio(leader), workload_imbalance, auction_data, params, auction_data.utility_iter);
+        follower_bid = calculateBid(follower, task_id, robot_workload(follower), workload_ratio(follower), workload_imbalance, auction_data, params, auction_data.utility_iter);
+        
+        % Joint bid is the minimum of the two (limiting factor)
+        joint_bid = min(leader_bid, follower_bid);
+        
+        % Utility is bid minus price
+        joint_utility = joint_bid - auction_data.prices(task_id);
+        
+        % Only proceed if utility is positive
+        if joint_utility <= 0
             return;
         end
         
-        % Get current time
-        if isfield(params, 'current_time')
-            current_time = params.current_time;
-        else
-            current_time = auction_data.utility_iter;
+        % Both robots must be unassigned or already assigned to this task
+        if (auction_data.assignment(task_id) ~= leader && auction_data.assignment(task_id) ~= follower && auction_data.assignment(task_id) ~= 0)
+            return;
         end
         
-        % Determine leader based on bid values or capability
-        if auction_data.leader_assignment(task_id) == 0
-            % Calculate leader cost
-            cost1 = calculateLeaderCost(robot1, task_id, robots, tasks, auction_data);
-            cost2 = calculateLeaderCost(robot2, task_id, robots, tasks, auction_data);
-            
-            if cost1 <= cost2
-                auction_data.leader_assignment(task_id) = robot1;
-            else
-                auction_data.leader_assignment(task_id) = robot2;
-            end
+        % If we made it here, we can assign the task collaboratively
+        auction_data.assignment(task_id) = -2;  % Special marker for collaborative tasks
+        
+        % We need to store which robot is leader and which is follower
+        if ~isfield(auction_data, 'collaborative_leaders')
+            auction_data.collaborative_leaders = zeros(length(tasks), 1);
+            auction_data.collaborative_followers = zeros(length(tasks), 1);
         end
         
-        leader = auction_data.leader_assignment(task_id);
-        follower = 3 - leader;  % Other robot (either 1 or 2)
+        auction_data.collaborative_leaders(task_id) = leader;
+        auction_data.collaborative_followers(task_id) = follower;
         
-        % Implement the three-step synchronization protocol
-        switch auction_data.sync_status(task_id)
-            case 0  % Initial state
-                % Leader sends notification
-                auction_data.sync_status(task_id) = 1;
-                auction_data.sync_start_time(task_id) = current_time;
-                
-            case 1  % Leader has sent notification
-                % Check if follower can acknowledge
-                follower_ready = isRobotReadyForTask(follower, task_id, robots, tasks, params);
-                
-                if follower_ready
-                    auction_data.sync_status(task_id) = 2;
-                end
-                
-            case 2  % Follower has acknowledged
-                % Joint execution can proceed
-                auction_data.sync_status(task_id) = 3;
-                auction_data.execution_start_time(task_id) = current_time;
-                
-            case 3  % Execution in progress
-                % Calculate execution progress
-                if isfield(tasks, 'execution_time')
-                    task_duration = tasks(task_id).execution_time;
-                else
-                    task_duration = 5; % Default duration
-                end
-                
-                elapsed_time = current_time - auction_data.execution_start_time(task_id);
-                progress = min(1.0, elapsed_time / task_duration);
-                
-                % Check if execution is complete
-                if progress >= 1.0
-                    auction_data.sync_status(task_id) = 4; % Completed
-                    auction_data.completion_status(task_id) = 1;
-                    sync_successful = true;
-                end
-        end
+        % Update price
+        auction_data.prices(task_id) = auction_data.prices(task_id) + params.epsilon;
         
-        % Check for timeout
-        if auction_data.sync_status(task_id) > 0 && auction_data.sync_status(task_id) < 3
-            if isfield(params, 'sync_timeout') && ...
-               current_time - auction_data.sync_start_time(task_id) > params.sync_timeout
-                % Synchronization timeout
-                auction_data.sync_status(task_id) = 0; % Reset synchronization
-                auction_data.leader_assignment(task_id) = 0; % Reassign leader
-            end
-        end
-        
-        return;
+        sync_successful = true;
     end
     
-    % Helper function to calculate leader cost
+    % =========================================================================
     function cost = calculateLeaderCost(robot_id, task_id, robots, tasks, auction_data)
-        % Distance factor - leader should be closer to task
-        distance = norm(robots(robot_id).position - tasks(task_id).position);
-        distance_factor = distance;
+        % CALCULATELEADERCOST Calculate the cost for a robot to be the leader in a collaborative task
+        %
+        % Parameters:
+        %   robot_id     - Robot ID
+        %   task_id      - Task ID
+        %   robots       - Array of robot structures
+        %   tasks        - Array of task structures
+        %   auction_data - Auction data structure
+        %
+        % Returns:
+        %   cost         - Calculated cost value (lower is better for leader)
         
-        % Capability factor - leader should have better match with task requirements
-        capability_match = 0.5; % Default
-        if isfield(robots, 'capabilities') && isfield(tasks, 'capabilities_required')
-            robot_capabilities = robots(robot_id).capabilities;
-            task_requirements = tasks(task_id).capabilities_required;
-            
-            % Normalize vectors
-            robot_cap_norm = robot_capabilities / norm(robot_capabilities);
-            task_cap_norm = task_requirements / norm(task_requirements);
-            
-            % Compute similarity (0 to 1, higher is better)
-            capability_match = dot(robot_cap_norm, task_cap_norm);
-        end
+        % Default cost - higher values are worse
+        cost = 1000;
         
-        % Workload factor - leader should have less workload
-        workload = 0;
-        if isfield(robots(robot_id), 'workload')
-            workload = robots(robot_id).workload;
-        else
-            % Calculate workload from assignments
-            task_count = sum(auction_data.assignment == robot_id);
-            workload = task_count;
-        end
-        
-        % Weighted cost (lower is better)
-        weights = [0.4, 0.4, 0.2]; % Distance, capability, workload
-        cost = weights(1) * distance_factor + ...
-               weights(2) * (1 - capability_match) + ...
-               weights(3) * workload;
-        
-        return;
-    end
-    
-    % Helper function to check if robot is ready for task
-    function ready = isRobotReadyForTask(robot_id, task_id, robots, tasks, params)
-        % Check if robot has failed
-        if robots(robot_id).failed
-            ready = false;
-            return;
-        end
-        
-        % Check distance to task
-        distance = norm(robots(robot_id).position - tasks(task_id).position);
-        max_sync_distance = 0.5; % Default
-        if isfield(params, 'max_sync_distance')
-            max_sync_distance = params.max_sync_distance;
-        end
-        position_ready = (distance <= max_sync_distance);
-        
-        % Check if robot has necessary capabilities
-        capability_ready = true;
-        if isfield(robots, 'capabilities') && isfield(tasks, 'capabilities_required')
-            robot_capabilities = robots(robot_id).capabilities;
-            task_requirements = tasks(task_id).capabilities_required;
-            
-            % Normalize vectors
-            robot_cap_norm = robot_capabilities / norm(robot_capabilities);
-            task_cap_norm = task_requirements / norm(task_requirements);
-            
-            capability_match = dot(robot_cap_norm, task_cap_norm);
-            capability_ready = (capability_match >= 0.7);
-        end
-        
-        % Check if robot is not busy with another task
-        busy_tasks = find(auction_data.assignment == robot_id & auction_data.completion_status < 1);
-        not_busy = isempty(busy_tasks) || ismember(task_id, busy_tasks);
-        
-        ready = position_ready && capability_ready && not_busy;
-        return;
-    end
-    
-    % Time-weighted consensus update based on mathematical foundations
-    function auction_data = runTimeWeightedConsensus(auction_data, robots, params)
-        % Get number of robots
-        num_robots = length(robots);
-        num_tasks = length(auction_data.assignment);
-        
-        % Create state vectors for each robot if they don't exist
-        if ~isfield(auction_data, 'state_vectors')
-            auction_data.state_vectors = cell(num_robots, 1);
-            for i = 1:num_robots
-                % Format: [robot positions, task prices, task assignments, task completion]
-                auction_data.state_vectors{i} = zeros(2*num_robots + 2*num_tasks, 1);
-                
-                % Initialize with known information
-                % Robot positions
-                for r = 1:num_robots
-                    auction_data.state_vectors{i}(2*(r-1)+1:2*r) = robots(r).position;
-                end
-                
-                % Task prices
-                auction_data.state_vectors{i}(2*num_robots+1:2*num_robots+num_tasks) = auction_data.prices;
-                
-                % Task assignments
-                auction_data.state_vectors{i}(2*num_robots+num_tasks+1:2*num_robots+2*num_tasks) = auction_data.assignment;
-            end
-            
-            % Initialize last update timestamp matrix
-            auction_data.last_update_time = zeros(num_robots, num_robots);
-        end
-        
-        % Update timestamps
-        auction_data.last_update_time = auction_data.last_update_time + 1;
-        
-        % First, update local state vectors with latest information
-        for i = 1:num_robots
-            % Update own position
-            auction_data.state_vectors{i}(2*(i-1)+1:2*i) = robots(i).position;
-            
-            % Update own knowledge of prices and assignments
-            auction_data.state_vectors{i}(2*num_robots+1:2*num_robots+num_tasks) = auction_data.prices;
-            auction_data.state_vectors{i}(2*num_robots+num_tasks+1:2*num_robots+2*num_tasks) = auction_data.assignment;
-        end
-        
-        % For each pair of robots, attempt information exchange
-        for i = 1:num_robots
-            if robots(i).failed
-                continue;
-            end
-            
-            % Get robot i's state vector
-            x_i = auction_data.state_vectors{i};
-            
-            % For each other robot j
-            for j = setdiff(1:num_robots, i)
-                if robots(j).failed
-                    continue;
-                end
-                
-                % Check communication conditions
-                dist_ij = norm(robots(i).position - robots(j).position);
-                
-                % Check if within communication range
-                if isfield(auction_data, 'comm_range') && ...
-                   length(auction_data.comm_range) >= i && ...
-                   dist_ij > auction_data.comm_range(i)
-                    continue;
-                end
-                
-                % Check packet loss probability
-                if isfield(auction_data, 'packet_loss_prob') && ...
-                   size(auction_data.packet_loss_prob, 1) >= i && ...
-                   size(auction_data.packet_loss_prob, 2) >= j && ...
-                   rand() < auction_data.packet_loss_prob(i, j)
-                    continue;  % Packet lost
-                end
-                
-                % Get robot j's state vector with delay
-                delay_ij = 0;
-                if isfield(auction_data, 'comm_delay') && ...
-                   size(auction_data.comm_delay, 1) >= i && ...
-                   size(auction_data.comm_delay, 2) >= j && ...
-                   auction_data.comm_delay(i, j) > 0
-                    delay_ij = auction_data.comm_delay(i, j);
-                end
-                
-                % For simplicity in simulation, we just use the current state
-                % In a real system, this would use a delayed state vector
-                x_j = auction_data.state_vectors{j};
-                
-                % Calculate time-decaying weight
-                time_diff = auction_data.last_update_time(i, j);
-                gamma = 0.5; % Default
-                lambda = 0.1; % Default
-                if isfield(params, 'gamma')
-                    gamma = params.gamma;
-                end
-                if isfield(params, 'lambda')
-                    lambda = params.lambda;
-                end
-                weight = gamma * exp(-lambda * time_diff);
-                
-                % Update state with time-weighted consensus
-                auction_data.state_vectors{i} = x_i + weight * (x_j - x_i);
-                
-                % Reset last update time
-                auction_data.last_update_time(i, j) = 0;
-            end
-        end
-        
-        % Extract consistent global view from state vectors
-        
-        % Update prices with consensus average - only for robot's own assigned tasks
-        for j = 1:num_tasks
-            assigned_robot = auction_data.assignment(j);
-            if assigned_robot > 0 && assigned_robot <= num_robots && ~robots(assigned_robot).failed
-                % Get the assigned robot's view of the price
-                auction_data.prices(j) = auction_data.state_vectors{assigned_robot}(2*num_robots + j);
+        try
+            % Distance cost
+            if isfield(robots, 'position') && isfield(tasks, 'position')
+                distance = norm(robots(robot_id).position - tasks(task_id).position);
+                distance_cost = distance;
             else
-                % For unassigned tasks, use average price across active robots
-                total_price = 0;
-                active_count = 0;
-                for i = 1:num_robots
-                    if ~robots(i).failed
-                        total_price = total_price + auction_data.state_vectors{i}(2*num_robots + j);
-                        active_count = active_count + 1;
-                    end
-                end
-                if active_count > 0
-                    auction_data.prices(j) = total_price / active_count;
-                end
-            end
-        end
-        
-        % Calculate consensus error for monitoring convergence
-        if ~isfield(auction_data, 'consensus_errors')
-            auction_data.consensus_errors = [];
-        end
-        
-        error = 0;
-        active_robots = find(~[robots.failed]);
-        if length(active_robots) >= 2
-            for i = active_robots
-                for j = active_robots
-                    if i < j
-                        % Calculate error for price consensus
-                        price_error = norm(auction_data.state_vectors{i}(2*num_robots+1:2*num_robots+num_tasks) - ...
-                                          auction_data.state_vectors{j}(2*num_robots+1:2*num_robots+num_tasks));
-                        
-                        % Calculate error for assignment consensus
-                        assign_error = sum(auction_data.state_vectors{i}(2*num_robots+num_tasks+1:2*num_robots+2*num_tasks) ~= ...
-                                          auction_data.state_vectors{j}(2*num_robots+num_tasks+1:2*num_robots+2*num_tasks));
-                        
-                        error = error + price_error + assign_error;
-                    end
-                end
-            end
-        end
-        
-        auction_data.consensus_errors = [auction_data.consensus_errors; error];
-        
-        return;
-    end
-    
-    % Analyze convergence of the bidding process
-    function [auction_data, converged, metrics] = analyzeBidConvergence(auction_data, params)
-        converged = false;
-        
-        % Calculate theoretical convergence time
-        num_tasks = length(auction_data.assignment);
-        b_max = max(params.alpha);
-        epsilon = params.epsilon;
-        theoretical_bound = num_tasks^2 * b_max / epsilon;
-        
-        % Check if we've converged based on iterations with no changes
-        unchanged_iterations = 0;
-        if isfield(auction_data, 'convergence_history') && length(auction_data.convergence_history) > 0
-            for i = length(auction_data.convergence_history):-1:1
-                if auction_data.convergence_history(i) == 0
-                    unchanged_iterations = unchanged_iterations + 1;
-                else
-                    break;
-                end
-            end
-        end
-        
-        % Require several unchanged iterations for convergence
-        required_unchanged = max(5, ceil(log(num_tasks) * 3));
-        
-        if unchanged_iterations >= required_unchanged
-            converged = true;
-            
-            % Calculate optimality gap compared to theoretical optimal
-            robot_utils_obj = robot_utils();
-            achieved_makespan = robot_utils_obj.calculateMakespan(auction_data.assignment, tasks, robots);
-            optimal_makespan = robot_utils_obj.calculateOptimalMakespan(tasks, robots);
-            auction_data.optimality_gap = abs(achieved_makespan - optimal_makespan);
-            
-            % Check against theoretical bound (2ε)
-            theoretical_gap = 2 * epsilon;
-            
-            % Prepare metrics
-            metrics.converged = true;
-            metrics.iterations = auction_data.utility_iter;
-            metrics.theoretical_bound = theoretical_bound;
-            metrics.iterations_ratio = auction_data.utility_iter / theoretical_bound;
-            metrics.achieved_makespan = achieved_makespan;
-            metrics.optimal_makespan = optimal_makespan;
-            metrics.optimality_gap = auction_data.optimality_gap;
-            metrics.theoretical_gap = theoretical_gap;
-            metrics.gap_ratio = auction_data.optimality_gap / theoretical_gap;
-        else
-            metrics.converged = false;
-        end
-        
-        return;
-    end
-    
-    % Run enhanced auction simulation
-    function [metrics, converged] = runEnhancedAuctionSimulation(params, env, robots, tasks, visualize)
-        % Initialize auction data
-        auction_data = enhancedInitializeAuctionData(tasks, robots);
-        
-        % Set up communication model
-        auction_data = setupCommunicationModel(auction_data, robots, params);
-        
-        % Initialize metrics
-        metrics = initializeMetrics();
-        
-        % Main simulation loop
-        max_iterations = 1000;
-        converged = false;
-        
-        % Find initially available tasks
-        task_utils_obj = task_utils();
-        available_tasks = task_utils_obj.findAvailableTasks(tasks, []);
-        
-        for iter = 1:max_iterations
-            % Set current time
-            params.current_time = iter;
-            metrics.iterations = iter;
-            
-            % Check for robot failures
-            [failures, auction_data] = detectFailures(auction_data, robots, params);
-            
-            % Handle any new failures
-            if any(failures)
-                for i = find(failures)
-                    if visualize
-                        fprintf('Robot %d has failed at iteration %d\n', i, iter);
-                    end
-                    robots(i).failed = true;
-                    
-                    % Record metrics before failure
-                    metrics = recordPreFailureMetrics(metrics, auction_data, robots, tasks, i);
-                    
-                    % Initiate recovery process
-                    [auction_data, recovery_initiated] = enhancedRecovery(auction_data, robots, tasks, i, params);
-                    
-                    if recovery_initiated && visualize
-                        fprintf('Recovery initiated for robot %d failures\n', i);
-                    end
-                    metrics.failure_time = iter;
-                end
+                distance_cost = abs(robot_id - task_id);
             end
             
-            % Execute the distributed auction algorithm step
-            [auction_data, new_assignments, messages] = enhancedDistributedAuctionStep(auction_data, robots, tasks, available_tasks, params);
-            metrics.messages = metrics.messages + messages;
-            
-            % Update visualization
-            if visualize
-                try
-                    subplot(2, 3, [1, 4]);
-                    env_utils = environment_utils();
-                    env_utils.visualizeEnvironment(env, robots, tasks, auction_data);
-                    title(sprintf('Environment (Iteration %d)', iter));
-                    pause(0.01);
-                catch
-                    % Visualization failed, skip it
-                    if visualize
-                        fprintf('Warning: Visualization failed, continuing without it\n');
-                    end
-                end
-            end
-            
-            % Update metrics
-            metrics = updateMetricsHistory(metrics, auction_data, iter);
-            
-            % Update available tasks based on completed prerequisites
-            completed_tasks = find(auction_data.completion_status == 1);
-            [auction_data, available_tasks] = manageTaskDependencies(auction_data, tasks, completed_tasks);
-            
-            % Check for recovery completion
-            if metrics.failure_time > 0 && metrics.recovery_time == 0
-                if isRecoveryComplete(auction_data, robots, metrics.failed_robot)
-                    metrics.recovery_time = iter - metrics.failure_time;
-                    if visualize
-                        fprintf('Recovery completed after %d iterations\n', metrics.recovery_time);
-                    end
-                end
-            end
-            
-            % Check for convergence
-            [auction_data, converged, convergence_metrics] = analyzeBidConvergence(auction_data, params);
-            
-            if converged
-                if visualize
-                    fprintf('Auction algorithm converged after %d iterations\n', iter);
-                end
-                metrics.converged = true;
-                break;
-            end
-            
-            % Update utility iteration
-            auction_data.utility_iter = auction_data.utility_iter + 1;
-            
-            % Stop if we reach max iterations
-            if iter == max_iterations
-                if visualize
-                    fprintf('Maximum iterations (%d) reached without convergence\n', max_iterations);
-                end
-                break;
-            end
-        end
-        
-        % Calculate final metrics
-        metrics = calculateFinalMetrics(metrics, auction_data, robots, tasks, params);
-        
-        return;
-    end
-    
-    % Helper function to setup communication model
-    function auction_data = setupCommunicationModel(auction_data, robots, params)
-        num_robots = length(robots);
-        
-        % Set up communication delays
-        if isfield(params, 'comm_delay')
-            if isscalar(params.comm_delay)
-                % Uniform delay
-                auction_data.comm_delay = params.comm_delay * ones(num_robots, num_robots);
+            % Capability matching
+            if isfield(robots, 'capabilities') && isfield(tasks, 'capabilities_required')
+                robot_cap = robots(robot_id).capabilities;
+                task_cap = tasks(task_id).capabilities_required;
+                
+                % Normalize vectors to unit length
+                robot_cap_norm = robot_cap / norm(robot_cap);
+                task_cap_norm = task_cap / norm(task_cap);
+                
+                % Compute cosine similarity (normalized dot product)
+                capability_match = dot(robot_cap_norm, task_cap_norm);
+                capability_cost = 1 - capability_match;
             else
-                % Custom delay matrix
-                auction_data.comm_delay = params.comm_delay;
+                capability_cost = 0.2;
             end
-        else
-            % Default: no delay
-            auction_data.comm_delay = zeros(num_robots, num_robots);
-        end
-        
-        % Set up packet loss probabilities
-        if isfield(params, 'packet_loss_prob')
-            if isscalar(params.packet_loss_prob)
-                % Uniform probability
-                auction_data.packet_loss_prob = params.packet_loss_prob * ones(num_robots, num_robots);
-            else
-                % Custom probability matrix
-                auction_data.packet_loss_prob = params.packet_loss_prob;
+            
+            % Workload cost
+            workload = 0;
+            for j = 1:length(tasks)
+                if auction_data.assignment(j) == robot_id
+                    if isfield(tasks, 'execution_time')
+                        workload = workload + tasks(j).execution_time;
+                    else
+                        workload = workload + 1;
+                    end
+                end
             end
-        else
-            % Default: no packet loss
-            auction_data.packet_loss_prob = zeros(num_robots, num_robots);
+            workload_cost = workload / 10;
+            
+            % Combine costs with weights
+            cost = 0.4 * distance_cost + 0.4 * capability_cost + 0.2 * workload_cost;
+        catch
+            % If there's an error, return the default high cost
+            cost = 1000;
         end
-        
-        % Set up communication ranges
-        if isfield(params, 'comm_range')
-            if isscalar(params.comm_range)
-                % Uniform range
-                auction_data.comm_range = params.comm_range * ones(num_robots, 1);
-            else
-                % Custom range vector
-                auction_data.comm_range = params.comm_range;
-            end
-        else
-            % Default: infinite range
-            auction_data.comm_range = Inf * ones(num_robots, 1);
-        end
-        
-        return;
     end
     
-    % Helper function to initialize metrics
-    function metrics = initializeMetrics()
-        metrics = struct();
-        metrics.iterations = 0;
-        metrics.messages = 0;
-        metrics.convergence_history = [];
-        metrics.price_history = [];
-        metrics.assignment_history = [];
-        metrics.completion_time = 0;
-        metrics.optimality_gap = 0;
-        metrics.recovery_time = 0;
-        metrics.failed_task_count = 0;
-        metrics.failure_time = 0;
-        metrics.makespan = 0;
-        metrics.optimal_makespan = 0;
-        metrics.makespan_before_failure = 0;
-        metrics.theoretical_recovery_bound = 0;
-        metrics.oscillation_count = 0;
-        metrics.converged = false;
-    end
-    
-    % Helper function to record pre-failure metrics
-    function metrics = recordPreFailureMetrics(metrics, auction_data, robots, tasks, failed_robot)
-        % Count tasks assigned to the failed robot
-        metrics.failed_task_count = sum(auction_data.assignment == failed_robot);
+    % =========================================================================
+    function analyzeTaskAllocation(auction_data, tasks)
+        % ANALYZETASKALLOCATION Analyzes the current task allocation
+        %
+        % Parameters:
+        %   auction_data - Auction data structure
+        %   tasks        - Array of task structures
         
-        % Record makespan before failure
-        robot_utils_obj = robot_utils();
-        metrics.makespan_before_failure = robot_utils_obj.calculateMakespan(auction_data.assignment, tasks, robots);
+        % Group tasks by assigned robot
+        num_robots = 10;  % Assume up to 10 robots for simplicity
+        robot_tasks = cell(num_robots, 1);
         
-        % Record workload distribution before failure
-        robot_workloads = zeros(length(robots), 1);
         for j = 1:length(tasks)
             r = auction_data.assignment(j);
-            if r > 0
-                if isfield(tasks, 'execution_time')
-                    robot_workloads(r) = robot_workloads(r) + tasks(j).execution_time;
+            if r > 0 && r <= num_robots
+                if isempty(robot_tasks{r})
+                    robot_tasks{r} = j;
                 else
-                    robot_workloads(r) = robot_workloads(r) + 1;
+                    robot_tasks{r} = [robot_tasks{r}, j];
                 end
             end
         end
-        metrics.workload_before_failure = robot_workloads;
         
-        % Store tasks assigned to the failed robot
-        metrics.failed_robot = failed_robot;
-        metrics.failed_robot_tasks = find(auction_data.assignment == failed_robot);
+        % Print task allocation
+        fprintf('Task Allocation: ');
+        for i = 1:num_robots
+            if ~isempty(robot_tasks{i})
+                fprintf('R%d: [', i);
+                fprintf('%d ', robot_tasks{i});
+                fprintf('] ');
+            end
+        end
+        fprintf('\n');
         
-        return;
-    end
-    
-    % Helper function to update metrics history
-    function metrics = updateMetricsHistory(metrics, auction_data, iter)
-        % Update price history
-        if isempty(metrics.price_history)
-            metrics.price_history = zeros(length(auction_data.prices), 1000);  % Preallocate
-        end
-        if iter <= size(metrics.price_history, 2)
-            metrics.price_history(:, iter) = auction_data.prices;
-        end
-        
-        % Update assignment history
-        if isempty(metrics.assignment_history)
-            metrics.assignment_history = zeros(length(auction_data.assignment), 1000);  % Preallocate
-        end
-        if iter <= size(metrics.assignment_history, 2)
-            metrics.assignment_history(:, iter) = auction_data.assignment;
+        % Calculate workload balance
+        workload = zeros(num_robots, 1);
+        for j = 1:length(tasks)
+            r = auction_data.assignment(j);
+            if r > 0 && r <= num_robots
+                if isfield(tasks, 'execution_time')
+                    workload(r) = workload(r) + tasks(j).execution_time;
+                else
+                    workload(r) = workload(r) + 1;  % Default execution time
+                end
+            end
         end
         
-        % Calculate convergence metric (change in assignments)
-        if iter > 1 && iter <= size(metrics.assignment_history, 2)
-            conv_metric = sum(metrics.assignment_history(:, iter) ~= metrics.assignment_history(:, iter-1));
-            metrics.convergence_history(iter) = conv_metric;
+        % Calculate workload ratio (max to min)
+        active_robots = find(workload > 0);
+        if length(active_robots) >= 2
+            workload_ratio = max(workload(active_robots)) / min(workload(active_robots));
         else
-            metrics.convergence_history(iter) = NaN;
+            workload_ratio = 0;
         end
         
-        return;
+        fprintf('Workload: ');
+        for i = 1:min(2, num_robots)  % Show workload for at least first two robots
+            fprintf('R%d=%.2f, ', i, workload(i));
+        end
+        fprintf('Ratio=%.2f\n', workload_ratio);
+        
+        % Report unassigned tasks if any
+        unassigned = sum(auction_data.assignment == 0);
+        if unassigned > 0
+            fprintf('WARNING: %d tasks remain unassigned!\n', unassigned);
+            
+            % Show which tasks are unassigned and how long they've been unassigned
+            unassigned_tasks = find(auction_data.assignment == 0);
+            fprintf('Unassigned tasks: ');
+            for j = unassigned_tasks
+                fprintf('T%d (unassigned for %d iterations) ', j, auction_data.unassigned_iterations(j));
+            end
+            fprintf('\n');
+        end
+        
+        % Report oscillations
+        fprintf('Task oscillations: ');
+        has_oscillations = false;
+        for j = 1:length(tasks)
+            if auction_data.task_oscillation_count(j) > 0
+                fprintf('T%d:%d ', j, auction_data.task_oscillation_count(j));
+                has_oscillations = true;
+            end
+        end
+        if ~has_oscillations
+            fprintf('None');
+        end
+        fprintf('\n');
     end
     
-    % Helper function to calculate final metrics
-    function metrics = calculateFinalMetrics(metrics, auction_data, robots, tasks, params)
-        % Trim history matrices to actual size
-        iter = metrics.iterations;
-        if ~isempty(metrics.price_history) && size(metrics.price_history, 2) >= iter
-            metrics.price_history = metrics.price_history(:, 1:iter);
+    % =========================================================================
+    function analyzeBidDistribution(auction_data, robots, tasks)
+        % ANALYZEBIDDISTRIBUTION Analyzes the current bid distribution
+        %
+        % Parameters:
+        %   auction_data - Auction data structure
+        %   robots       - Array of robot structures
+        %   tasks        - Array of task structures
+        
+        fprintf('\n--- Bid Analysis ---\n');
+        for i = 1:length(robots)
+            if isfield(robots, 'failed') && robots(i).failed
+                fprintf('Robot %d: FAILED\n', i);
+                continue;
+            end
+            fprintf('Robot %d bids:\n', i);
+            for j = 1:length(tasks)
+                fprintf('  Task %d: Bid=%.3f, Utility=%.3f, Price=%.3f\n', ...
+                    j, auction_data.bids(i,j), auction_data.utilities(i,j), auction_data.prices(j));
+            end
         end
-        if ~isempty(metrics.assignment_history) && size(metrics.assignment_history, 2) >= iter
-            metrics.assignment_history = metrics.assignment_history(:, 1:iter);
+    end
+end
+
+% =========================================================================
+function [metrics, converged] = runEnhancedAuctionSimulation(params, env, robots, tasks, visualize)
+    % RUNENHANCEDAUCTIONSIMULATION Run a complete enhanced auction algorithm simulation
+    %
+    % Parameters:
+    %   params    - Algorithm parameters structure
+    %   env       - Environment structure
+    %   robots    - Array of robot structures
+    %   tasks     - Array of task structures
+    %   visualize - Boolean flag for visualization
+    %
+    % Returns:
+    %   metrics   - Performance metrics structure
+    %   converged - Boolean indicating convergence
+
+    % Other utility functions needed
+    robot_util = robot_utils();
+    task_util = task_utils();
+    env_utils = environment_utils();
+    
+    % Display robot capabilities if visualization is enabled
+    if visualize
+        fprintf('Robot capabilities:\n');
+        for i = 1:length(robots)
+            fprintf('Robot %d: [%.2f %.2f %.2f %.2f %.2f]\n', i, robots(i).capabilities);
         end
         
-        % Calculate makespan
-        robot_utils_obj = robot_utils();
-        try
-            metrics.makespan = robot_utils_obj.calculateMakespan(auction_data.assignment, tasks, robots);
-            metrics.optimal_makespan = robot_utils_obj.calculateOptimalMakespan(tasks, robots);
-        catch
-            % Fallback if direct calculation fails
+        % Count collaborative tasks
+        num_collaborative = 0;
+        if isfield(tasks, 'collaborative')
+            for i = 1:length(tasks)
+                if any(tasks(i).collaborative == true) || any(tasks(i).collaborative == 1)
+                        num_collaborative = num_collaborative + 1;
+                end
+            end
+        end
+        
+        fprintf('Starting enhanced auction algorithm simulation...\n');
+        fprintf('Number of robots: %d, Number of tasks: %d\n', length(robots), length(tasks));
+        fprintf('Number of collaborative tasks: %d\n', num_collaborative);
+        
+        % Print task details for inspection
+        fprintf('\nTask details:\n');
+        for i = 1:length(tasks)
+            prereqs = tasks(i).prerequisites;
+            if isempty(prereqs)
+                prereq_str = 'none';
+            else
+                prereq_str = sprintf('%d ', prereqs);
+            end
+            
+            collab_str = '';
+            if isfield(tasks, 'collaborative') && (any(tasks(i).collaborative == true) || any(tasks(i).collaborative == 1))
+                collab_str = ' (Collaborative)';
+            end
+            
+            fprintf('Task %d: position=[%.1f, %.1f], time=%.1f, prereqs=[%s]%s\n', ...
+                i, tasks(i).position(1), tasks(i).position(2), tasks(i).execution_time, prereq_str, collab_str);
+        end
+    end
+    
+    % Initialize heartbeat parameters if not provided
+    if ~isfield(params, 'warmup_iterations')
+        params.warmup_iterations = 10;
+    end
+    if ~isfield(params, 'heartbeat_timeout')
+        params.heartbeat_timeout = 5;
+    end
+    if ~isfield(params, 'enable_progress_detection')
+        params.enable_progress_detection = false;
+    end
+    
+    % Create data structures for the auction algorithm
+    utils = enhanced_auction_utils();
+    auction_data = utils.initializeAuctionData(tasks, robots);
+    
+    % Visualization setup if enabled
+    if visualize
+        figure('Name', 'Enhanced Distributed Auction Algorithm Simulation', 'Position', [100, 100, 1200, 800]);
+        subplot(2, 3, [1, 4]);
+        env_utils.visualizeEnvironment(env, robots, tasks, auction_data);
+        title('Environment');
+    end
+    
+    % Performance metrics
+    metrics = struct();
+    metrics.iterations = 0;
+    metrics.messages = 0;
+    metrics.convergence_history = [];
+    metrics.price_history = zeros(length(tasks), 1000);  % Preallocate
+    metrics.assignment_history = zeros(length(tasks), 1000);
+    metrics.completion_time = 0;
+    metrics.optimality_gap = 0;
+    metrics.recovery_time = 0;
+    metrics.failure_time = 0;  % Initialize failure_time field
+    metrics.makespan = 0;
+    metrics.makespan_before_failure = 0;
+    
+    % Main simulation loop
+    max_iterations = 150;
+    converged = false;
+    
+    % Track iterations without changes for convergence detection
+    unchanged_iterations = 0;
+    stable_workload_iterations = 0;
+    
+    % Find initially available tasks (only those with no prerequisites)
+    available_tasks = task_util.findAvailableTasks(tasks, []);
+    
+    % Main loop
+    for iter = 1:max_iterations
+        metrics.iterations = iter;
+        
+        % Check for programmed robot failure (from parameters)
+        if iter == params.failure_time && ~isempty(params.failed_robot)
+            if visualize
+                fprintf('Robot %d has failed at iteration %d (programmed)\n', params.failed_robot, iter);
+            end
+            if isfield(robots, 'failed')
+                robots(params.failed_robot).failed = true;
+            end
+            
+            % Record workload and makespan before failure
             robot_loads = zeros(length(robots), 1);
             for j = 1:length(tasks)
                 r = auction_data.assignment(j);
@@ -1128,84 +1187,293 @@ function utils = enhanced_auction_utils()
                     end
                 end
             end
-            metrics.makespan = max(robot_loads);
+            metrics.makespan_before_failure = max(robot_loads);
             
-            % Better optimal makespan approximation
-            total_load = sum(robot_loads);
-            active_robots = sum(~[robots.failed]);
-            if active_robots > 0
-                balanced_load = total_load / active_robots;
+            % Initiate recovery process for programmed failure
+            [auction_data, recovery_status] = initiateRecovery(auction_data, robots, tasks, params.failed_robot);
+            metrics.failure_time = iter;
+        end
+        
+        % Check for heartbeat failures
+        [failures, auction_data] = utils.detectFailures(auction_data, robots, params);
+        
+        % Handle any detected failures
+        for i = 1:length(failures)
+            [auction_data, recovery_status] = initiateRecovery(auction_data, robots, tasks, failures(i));
+            if visualize
+                fprintf('Recovery initiated for robot %d failures\n', failures(i));
+                
+                % Handle failed recovery
+                if recovery_status == -1
+                    fprintf('WARNING: Recovery failed due to all robots being unavailable.\n');
+                end
+            end
+        end
+        
+        % Simulate one step of the distributed auction algorithm
+        [auction_data, new_assignments, messages] = utils.enhancedDistributedAuctionStep(auction_data, robots, tasks, available_tasks, params, iter);
+        metrics.messages = metrics.messages + messages;
+        
+        % Calculate makespan for current assignment
+        try
+            current_makespan = robot_util.calculateMakespan(auction_data.assignment, tasks, robots);
+            metrics.makespan = current_makespan;
+        catch e
+            if visualize
+                fprintf('Warning: %s\n', e.message);
+            end
+        end
+        
+        % Update visualization if enabled
+        if visualize
+            subplot(2, 3, [1, 4]);
+            env_utils.visualizeEnvironment(env, robots, tasks, auction_data);
+            title(sprintf('Environment (Iteration %d)', iter));
+        end
+        
+        % Update metrics
+        metrics.price_history(:, iter) = auction_data.prices;
+        metrics.assignment_history(:, iter) = auction_data.assignment;
+        
+        % Calculate convergence metric (change in assignments)
+        if iter > 1
+            conv_metric = sum(metrics.assignment_history(:, iter) ~= metrics.assignment_history(:, iter-1));
+            metrics.convergence_history(iter) = conv_metric;
+            
+            % Update unchanged iterations counter
+            if conv_metric == 0
+                unchanged_iterations = unchanged_iterations + 1;
             else
-                balanced_load = total_load;
-            end
-            
-            % Optimal makespan is at least the balanced load or the max task time
-            max_task_time = 0;
-            for j = 1:length(tasks)
-                if isfield(tasks, 'execution_time')
-                    max_task_time = max(max_task_time, tasks(j).execution_time);
-                else
-                    max_task_time = 1;
-                end
-            end
-            
-            metrics.optimal_makespan = max(balanced_load, max_task_time);
-        end
-        
-        % Count task oscillations
-        if isfield(auction_data, 'task_oscillation_count')
-            metrics.oscillation_count = sum(auction_data.task_oscillation_count);
-        end
-        
-        % Ensure optimality gap is correctly calculated
-        metrics.optimality_gap = abs(metrics.makespan - metrics.optimal_makespan);
-        
-        % Theoretical recovery bound
-        if isfield(metrics, 'failed_robot') && ~isempty(metrics.failed_robot)
-            T_f = metrics.failed_task_count;
-            if isfield(params, 'alpha') && isfield(params, 'epsilon')
-                b_max = max(params.alpha);
-                epsilon = params.epsilon;
-                metrics.theoretical_recovery_bound = T_f + round(b_max/epsilon);
-            end
-        end
-        
-        return;
-    end
-    
-    % Helper function to check if recovery is complete
-    function complete = isRecoveryComplete(auction_data, robots, failed_robot)
-        complete = true;
-        
-        % Check if all tasks previously assigned to the failed robot
-        % have been reassigned to active robots
-        if isfield(auction_data, 'failure_assignment') && ~isempty(auction_data.failure_assignment)
-            failed_tasks = find(auction_data.failure_assignment == failed_robot);
-            
-            for i = 1:length(failed_tasks)
-                task_id = failed_tasks(i);
-                new_assignment = auction_data.assignment(task_id);
-                
-                % Task is still unassigned or marked for recovery
-                if new_assignment == 0 || new_assignment == -1 || new_assignment == failed_robot
-                    complete = false;
-                    break;
-                end
-                
-                % Check if the new robot is active
-                if new_assignment > 0 && new_assignment <= length(robots) && robots(new_assignment).failed
-                    complete = false;
-                    break;
-                end
+                unchanged_iterations = 0;
             end
         else
-            % Fallback approach if failure_assignment is not available
-            complete = ~any(auction_data.assignment == failed_robot);
+            metrics.convergence_history(iter) = NaN;
+            unchanged_iterations = 0;
         end
         
-        return;
+        % Check if any new tasks become available due to completed prerequisites
+        completed_tasks = find(auction_data.completion_status == 1);
+        available_tasks = task_util.findAvailableTasks(tasks, completed_tasks);
+        
+        % Track workload stability for convergence detection
+        current_workloads = zeros(length(robots), 1);
+        for r = 1:length(robots)
+            if ~(isfield(robots, 'failed') && robots(r).failed)
+                % Calculate workload for this robot
+                workload = 0;
+                for j = 1:length(tasks)
+                    if auction_data.assignment(j) == r
+                        if isfield(tasks, 'execution_time')
+                            workload = workload + tasks(j).execution_time;
+                        else
+                            workload = workload + 1;
+                        end
+                    end
+                end
+                current_workloads(r) = workload;
+            end
+        end
+        
+        % Check for workload stability
+        if iter > 5
+            % Calculate workload deviation from moving average
+            % This could be enhanced in a full implementation
+            workload_stable = true;
+            
+            if workload_stable
+                stable_workload_iterations = stable_workload_iterations + 1;
+            else
+                stable_workload_iterations = 0;
+            end
+        end
+        
+        % Reset mechanism for stalled situations
+        if mod(iter, 50) == 0 && iter > 100 && any(auction_data.assignment == 0)
+            unassigned_count = sum(auction_data.assignment == 0);
+            if visualize
+                fprintf('Reset triggered at iteration %d with %d unassigned tasks\n', iter, unassigned_count);
+            end
+            
+            % Reset prices for unassigned tasks to zero to restart bidding
+            unassigned_tasks = find(auction_data.assignment == 0);
+            auction_data.prices(unassigned_tasks) = 0;
+            
+            % Reset oscillation counts to allow fresh bidding
+            auction_data.task_oscillation_count(unassigned_tasks) = 0;
+            
+            % Reset convergence tracking
+            unchanged_iterations = 0;
+            stable_workload_iterations = 0;
+        end
+        
+        % Scale required stable iterations with problem complexity
+        min_required_stable = max(10, ceil(log(length(tasks)) * 5));
+        required_workload_stability = max(5, ceil(log(length(tasks)) * 3));
+        
+        % Diagnostics every 10 iterations
+        if visualize && mod(iter, 10) == 0
+            fprintf('Iteration %d: ', iter);
+            utils.analyzeTaskAllocation(auction_data, tasks);
+        end
+        
+        % Update recovery time if in recovery mode
+        if metrics.failure_time > 0 && metrics.recovery_time == 0
+            % Find tasks that were assigned to failed robots
+            failed_robot_tasks = [];
+            for r = 1:length(robots)
+                if isfield(robots, 'failed') && robots(r).failed
+                    % Find tasks that were assigned to this robot at failure time
+                    if isfield(auction_data, 'failure_assignment') && ~isempty(auction_data.failure_assignment)
+                        robot_tasks = find(auction_data.failure_assignment == r);
+                        failed_robot_tasks = [failed_robot_tasks, robot_tasks];
+                    end
+                end
+            end
+            
+            % Check if all failed robot tasks have been reassigned
+            all_reassigned = true;
+            for j = 1:length(failed_robot_tasks)
+                task_id = failed_robot_tasks(j);
+                % Task should be assigned to a non-failed robot or completed
+                if auction_data.assignment(task_id) <= 0 || ...
+                   (auction_data.assignment(task_id) > 0 && ...
+                    isfield(robots, 'failed') && ...
+                    robots(auction_data.assignment(task_id)).failed)
+                    all_reassigned = false;
+                    break;
+                end
+            end
+            
+            if all_reassigned
+                metrics.recovery_time = iter - metrics.failure_time;
+                if visualize
+                    fprintf('Recovery completed after %d iterations\n', metrics.recovery_time);
+                end
+            end
+        end
+        
+        % Check for convergence - stable assignments for sufficient iterations
+        if iter > 20 && unchanged_iterations >= min_required_stable && stable_workload_iterations >= required_workload_stability
+            unassigned_count = sum(auction_data.assignment == 0);
+            
+            % Allow convergence even with unassigned tasks if stable for longer
+            if unassigned_count == 0 || (unchanged_iterations >= 2*min_required_stable)
+                converged = true;
+                if visualize
+                    fprintf('Auction algorithm converged after %d iterations\n', iter);
+                end
+                break;
+            end
+        end
+        
+        % Pause for visualization
+        if visualize
+            pause(0.01);
+        end
     end
     
-    % Return the utils structure
-    return;
+    % Trim history matrices to actual size
+    metrics.price_history = metrics.price_history(:, 1:iter);
+    metrics.assignment_history = metrics.assignment_history(:, 1:iter);
+    
+    % Plot results if visualization is enabled
+    if visualize
+        subplot(2, 3, 2);
+        env_utils.plotTaskPrices(metrics.price_history);
+        title('Task Prices Over Time');
+        
+        subplot(2, 3, 3);
+        env_utils.plotAssignments(metrics.assignment_history, length(robots));
+        title('Task Assignments Over Time');
+        
+        subplot(2, 3, 5);
+        env_utils.plotConvergence(metrics.convergence_history);
+        title('Convergence Metric');
+        
+        subplot(2, 3, 6);
+        env_utils.plotWorkload(metrics.assignment_history(:, end), tasks, robots);
+        title('Final Workload Distribution');
+    end
+    
+    % Calculate optimality gap
+    try
+        optimal_makespan = robot_util.calculateOptimalMakespan(tasks, robots);
+        metrics.optimality_gap = abs(metrics.makespan - optimal_makespan);
+        metrics.theoretical_gap_bound = 2 * params.epsilon;
+    catch e
+        if visualize
+            fprintf('Warning: Error calculating optimality gap: %s\n', e.message);
+        end
+        metrics.optimality_gap = NaN;
+        metrics.theoretical_gap_bound = NaN;
+    end
+    
+    % Display final metrics if visualization is enabled
+    if visualize
+        fprintf('\n--- Final Performance Metrics ---\n');
+        fprintf('Iterations to converge: %d\n', metrics.iterations);
+        fprintf('Theoretical bound: O(K² · bₘₐₓ/ε) = O(%d)\n', numel(tasks)^2 * max(params.alpha) / params.epsilon);
+        fprintf('Messages exchanged: %d\n', metrics.messages);
+        fprintf('Achieved makespan: %.2f\n', metrics.makespan);
+        
+        if ~isnan(metrics.optimality_gap)
+            fprintf('Optimal makespan: %.2f\n', optimal_makespan);
+            fprintf('Optimality gap: %.2f\n', metrics.optimality_gap);
+            fprintf('Theoretical gap bound (2ε): %.2f\n', metrics.theoretical_gap_bound);
+        end
+        
+        if metrics.failure_time > 0
+            fprintf('Recovery time: %d iterations\n', metrics.recovery_time);
+            
+            % Count tasks assigned to failed robots
+            failed_task_count = 0;
+            for r = 1:length(robots)
+                if isfield(robots, 'failed') && robots(r).failed
+                    if isfield(auction_data, 'failure_assignment') && ~isempty(auction_data.failure_assignment)
+                        failed_task_count = failed_task_count + sum(auction_data.failure_assignment == r);
+                    end
+                end
+            end
+            
+            fprintf('Tasks reassigned after failure: %d\n', failed_task_count);
+            fprintf('Theoretical recovery bound: O(|Tᶠ|) + O(bₘₐₓ/ε) ≈ %d\n', ...
+                failed_task_count + round(max(params.alpha) / params.epsilon));
+            
+            if metrics.makespan_before_failure > 0
+                makespan_degradation = metrics.makespan - metrics.makespan_before_failure;
+                fprintf('Makespan before failure: %.2f\n', metrics.makespan_before_failure);
+                fprintf('Makespan degradation: %.2f (%.2f%%)\n', makespan_degradation, ...
+                        makespan_degradation / metrics.makespan_before_failure * 100);
+            end
+        end
+        
+        % Detailed final analysis
+        fprintf('\n--- Final Task Allocation Analysis ---\n');
+        utils.analyzeTaskAllocation(auction_data, tasks);
+        utils.analyzeBidDistribution(auction_data, robots, tasks);
+        
+        % Analyze collaborative tasks
+        if isfield(tasks, 'collaborative')
+            collaborative_tasks = [];
+            for i = 1:length(tasks)
+                if any(tasks(i).collaborative == true) || any(tasks(i).collaborative == 1)
+                    collaborative_tasks = [collaborative_tasks, i];
+                end
+            end
+            
+            if ~isempty(collaborative_tasks)
+                fprintf('\n--- Collaborative Task Analysis ---\n');
+                fprintf('Collaborative tasks: ');
+                for i = collaborative_tasks
+                    status = 'Unassigned';
+                    if auction_data.assignment(i) == -2
+                        status = 'Assigned collaboratively';
+                    elseif auction_data.assignment(i) > 0
+                        status = sprintf('Assigned to Robot %d only', auction_data.assignment(i));
+                    end
+                    fprintf('Task %d: %s\n', i, status);
+                end
+            end
+        end
+    end
 end

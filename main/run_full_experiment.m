@@ -15,13 +15,13 @@ function results = run_full_experiment()
     
     % Add required paths
     addpath('../common');
-    addpath('../utils');
+    addpath('..utils/');
     
     % Load utility functions
-    enhanced_auction_utils = enhanced_auction_utils();
-    robot_utils = robot_utils();
-    task_utils = task_utils();
-    env_utils = environment_utils();
+    enhanced_auction_util = enhanced_auction_utils();
+    robot_util = robot_utils();
+    task_util = task_utils();
+    env_util = environment_utils();
     
     % Define experimental factors
     task_counts = [4, 8, 16, 32];
@@ -55,7 +55,7 @@ function results = run_full_experiment()
     results.converged = false(num_task_levels, num_delay_levels, num_loss_levels, num_epsilon_levels, num_repetitions);
     
     % Create environment
-    env = env_utils.createEnvironment(4, 4);
+    env = env_util.createEnvironment(4, 4);
     
     % Counter for progress tracking
     total_experiments = num_task_levels * num_delay_levels * num_loss_levels * num_epsilon_levels * num_repetitions;
@@ -111,10 +111,10 @@ function results = run_full_experiment()
                         rng(1000 + rep);  % Different seed for each repetition
                         
                         % Create robots
-                        robots = robot_utils.createRobots(2, env);
+                        robots = robot_util.createRobots(2, env);
                         
                         % Create tasks
-                        tasks = task_utils.createTasks(K, env);
+                        tasks = task_util.createTasks(K, env);
                         
                         % For larger task sets, reduce dependency density to avoid deadlock
                         if K <= 10
@@ -123,7 +123,7 @@ function results = run_full_experiment()
                             dependency_prob = min(0.3, 3.0 / K);
                         end
                         
-                        tasks = task_utils.addTaskDependencies(tasks, dependency_prob);
+                        tasks = task_util.addTaskDependencies(tasks, dependency_prob);
                         
                         % Add collaborative tasks (approximately 20% of tasks)
                         num_collaborative = max(1, round(K * 0.2));
@@ -143,7 +143,7 @@ function results = run_full_experiment()
                         end
                         
                         % Run simulation
-                        [metrics, converged] = enhanced_auction_utils.runAuctionSimulation(params, env, robots, tasks, false);
+                        [metrics, converged] = enhanced_auction_util.runEnhancedAuctionSimulation(params, env, robots, tasks, false);
                         
                         % Store results
                         results.makespan(t_idx, d_idx, p_idx, e_idx, rep) = metrics.makespan;

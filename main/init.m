@@ -2,37 +2,37 @@
 % This script adds all the necessary paths
 
 % Add common utilities
-addpath('./common');
+addpath('../common');
 
 % Add main scripts
-addpath('./main');
+addpath('../main');
 
 % Add experiments
-addpath('./experiments');
+addpath('../experiments');
 
 % Add tests
-addpath('./tests');
+addpath('../tests');
 
 % Add optimization tools
-addpath('./optimization');
+addpath('../optimization');
 
 % Add utility scripts
-addpath('./utils');
+addpath('../utils');
 
 % Create results and figures directories if they don't exist
-if ~exist('./results', 'dir')
-    mkdir('./results');
-    mkdir('./results/basic_convergence');
-    mkdir('./results/communication_constraints');
-    mkdir('./results/failure_recovery');
-    mkdir('./results/task_dependencies');
-    mkdir('./results/parameter_optimization');
-    mkdir('./results/full_experiment');
+if ~exist('../results', 'dir')
+    mkdir('../results');
+    mkdir('../results/basic_convergence');
+    mkdir('../results/communication_constraints');
+    mkdir('../results/failure_recovery');
+    mkdir('../results/task_dependencies');
+    mkdir('../results/parameter_optimization');
+    mkdir('../results/full_experiment');
 end
 
 if ~exist('./figures', 'dir')
-    mkdir('./figures');
-    mkdir('./figures/basic_convergence');
+    mkdir('../figures');
+    mkdir('../figures/basic_convergence');
     mkdir('./figures/communication_constraints');
     mkdir('./figures/failure_recovery');
     mkdir('./figures/task_dependencies');
