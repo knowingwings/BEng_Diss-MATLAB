@@ -374,21 +374,26 @@ function utils = enhanced_auction_utils()
                     j = sorted_unassigned_tasks(task_idx);
                     unassigned_iter = auction_data.unassigned_iterations(j);
                     
-                    % Progressive price reduction - more aggressive for longer unassigned tasks
+                    % MODIFIED: More aggressive price reduction schedule
                     if unassigned_iter > 30
-                        reduction_factor = 0.3; % Very aggressive reduction
+                        reduction_factor = 0.2; % Was 0.3
                     elseif unassigned_iter > 20
-                        reduction_factor = 0.5; % Strong reduction
+                        reduction_factor = 0.3; % Was 0.5
                     elseif unassigned_iter > 10
-                        reduction_factor = 0.7; % Moderate reduction
+                        reduction_factor = 0.5; % Was 0.7
                     else
-                        reduction_factor = 0.9; % Mild reduction
+                        reduction_factor = 0.8; % Was 0.9
                     end
                     
                     auction_data.prices(j) = auction_data.prices(j) * reduction_factor;
                     
-                    % Ensure price doesn't go below zero
-                    auction_data.prices(j) = max(0, auction_data.prices(j));
+                    % NEW: Reset to zero if price still too high after multiple reductions
+                    if unassigned_iter > 40
+                        auction_data.prices(j) = 0;
+                    else
+                        % Ensure price doesn't go below zero
+                        auction_data.prices(j) = max(0, auction_data.prices(j));
+                    end
                     
                     % Clear oscillation history to allow fresh bidding
                     if unassigned_iter > 15
@@ -425,7 +430,7 @@ function utils = enhanced_auction_utils()
         %   auction_data - Updated auction data structure
         
         failures = [];
-        
+    
         % Don't detect failures during warm-up period to avoid false positives
         if ~isfield(params, 'warmup_iterations')
             params.warmup_iterations = 10; % Default warm-up period
@@ -450,14 +455,14 @@ function utils = enhanced_auction_utils()
             % Calculate time since last heartbeat
             heartbeat_age = auction_data.current_time - auction_data.last_heartbeat(i);
             
-            % For debugging - uncomment if needed
-            % fprintf('Iteration %d: Robot %d heartbeat age: %.2f (threshold: %.2f)\n', ...
-            %        auction_data.current_time, i, heartbeat_age, params.heartbeat_timeout);
+            % MODIFIED: Add debug output to trace heartbeat status
+            fprintf('DEBUG: Iteration %d: Robot %d heartbeat age: %.2f (threshold: %.2f)\n', ...
+                auction_data.current_time, i, heartbeat_age, params.heartbeat_timeout);
             
             % Check if heartbeat timeout has occurred
             if heartbeat_age > params.heartbeat_timeout
                 fprintf('Robot %d has failed at iteration %d (heartbeat timeout)\n', ...
-                       i, auction_data.current_time);
+                    i, auction_data.current_time);
                 
                 % Record the failure
                 failures = [failures, i];
@@ -468,6 +473,20 @@ function utils = enhanced_auction_utils()
                 end
                 
                 % Record failure time for recovery tracking
+                auction_data.failed_robots(i) = 1;
+                auction_data.failure_time(i) = auction_data.current_time;
+            end
+        end
+        
+        % NEW: Inject a simulated failure for testing if specified
+        if isfield(params, 'failure_time') && params.failure_time == auction_data.current_time && ~isempty(params.failed_robot)
+            i = params.failed_robot;
+            if ~isfield(robots, 'failed') || ~robots(i).failed
+                fprintf('INJECTED: Robot %d failure at iteration %d\n', i, auction_data.current_time);
+                failures = [failures, i];
+                if isfield(robots, 'failed')
+                    robots(i).failed = true;
+                end
                 auction_data.failed_robots(i) = 1;
                 auction_data.failure_time(i) = auction_data.current_time;
             end
@@ -534,6 +553,21 @@ function utils = enhanced_auction_utils()
         % Returns:
         %   auction_data    - Updated auction data structure
         %   recovery_status - Status code (1=success, 0=partial, -1=failure)
+
+        fprintf('RECOVERY DEBUG: Initiating recovery for robot %d\n', failed_robot_id);
+    
+        % Store DEEP COPY of current assignment state
+        auction_data.failure_assignment = auction_data.assignment(:);
+        auction_data.recovery_mode = true;
+        
+        % Print assignment before failure
+        fprintf('RECOVERY DEBUG: Assignment before failure: ');
+        for j = 1:length(auction_data.assignment)
+            if auction_data.assignment(j) == failed_robot_id
+                fprintf('%d ', j);
+            end
+        end
+        fprintf('\n');
         
         % Initialize return status
         recovery_status = 1; % 1 = success, 0 = partial success, -1 = cannot recover
@@ -721,16 +755,16 @@ function utils = enhanced_auction_utils()
         if auction_data.assignment(task_id) == 0
             unassigned_iter = auction_data.unassigned_iterations(task_id);
             
-            % Exponential bonus scaling for persistent unassigned tasks
+            % MODIFIED: Higher exponential bonus scaling for persistent unassigned tasks
             if unassigned_iter > 25
-                task_unassigned_bonus = min(6.0, 0.5 * exp(unassigned_iter/10));
+                task_unassigned_bonus = min(10.0, 1.0 * exp(unassigned_iter/8)); % Increased from 6.0 to 10.0, changed divisor from 10 to 8
             elseif unassigned_iter > 15
-                task_unassigned_bonus = min(4.0, 0.4 * exp(unassigned_iter/12));
+                task_unassigned_bonus = min(6.0, 0.6 * exp(unassigned_iter/10)); % Increased from 4.0 to 6.0, from 0.4 to 0.6
             elseif unassigned_iter > 5
-                task_unassigned_bonus = min(3.0, 0.3 * unassigned_iter);
+                task_unassigned_bonus = min(4.0, 0.4 * unassigned_iter); % Increased from 3.0 to 4.0, from 0.3 to 0.4
             end
         end
-        
+                
         % Add scaling factor for tasks that need to be assigned quickly
         iteration_factor = 0;
         if iter > 20 && auction_data.assignment(task_id) == 0
@@ -1365,51 +1399,54 @@ function [metrics, converged] = runEnhancedAuctionSimulation(params, env, robots
         
         % Update recovery time if in recovery mode
         if metrics.failure_time > 0 && metrics.recovery_time == 0
-            % Find tasks that were assigned to failed robots
-            failed_robot_tasks = [];
-            for r = 1:length(robots)
-                if isfield(robots, 'failed') && robots(r).failed
-                    % Find tasks that were assigned to this robot at failure time
-                    if isfield(auction_data, 'failure_assignment') && ~isempty(auction_data.failure_assignment)
-                        robot_tasks = find(auction_data.failure_assignment == r);
-                        failed_robot_tasks = [failed_robot_tasks, robot_tasks];
+            % Find tasks that were assigned to failed robots at failure time
+            if isfield(auction_data, 'failure_assignment') && ~isempty(auction_data.failure_assignment)
+                failed_tasks = find(auction_data.failure_assignment == params.failed_robot);
+                
+                % Debug output
+                fprintf('RECOVERY TRACKING: Checking %d failed tasks at iter %d\n', length(failed_tasks), iter);
+                for j = 1:length(failed_tasks)
+                    fprintf('RECOVERY TRACKING: Task %d assigned to %d\n', failed_tasks(j), auction_data.assignment(failed_tasks(j)));
+                end
+                
+                % Check if all failed tasks are reassigned to working robots
+                all_reassigned = true;
+                for j = 1:length(failed_tasks)
+                    task_id = failed_tasks(j);
+                    new_robot = auction_data.assignment(task_id);
+                    if new_robot <= 0 || (isfield(robots, 'failed') && robots(new_robot).failed)
+                        all_reassigned = false;
+                        break;
                     end
                 end
-            end
-            
-            % Check if all failed robot tasks have been reassigned
-            all_reassigned = true;
-            for j = 1:length(failed_robot_tasks)
-                task_id = failed_robot_tasks(j);
-                % Task should be assigned to a non-failed robot or completed
-                if auction_data.assignment(task_id) <= 0 || ...
-                   (auction_data.assignment(task_id) > 0 && ...
-                    isfield(robots, 'failed') && ...
-                    robots(auction_data.assignment(task_id)).failed)
-                    all_reassigned = false;
-                    break;
-                end
-            end
-            
-            if all_reassigned
-                metrics.recovery_time = iter - metrics.failure_time;
-                if visualize
+                
+                if all_reassigned && ~isempty(failed_tasks)
+                    metrics.recovery_time = iter - metrics.failure_time;
                     fprintf('Recovery completed after %d iterations\n', metrics.recovery_time);
                 end
             end
         end
         
-        % Check for convergence - stable assignments for sufficient iterations
         if iter > 20 && unchanged_iterations >= min_required_stable && stable_workload_iterations >= required_workload_stability
             unassigned_count = sum(auction_data.assignment == 0);
-            
-            % Allow convergence even with unassigned tasks if stable for longer
-            if unassigned_count == 0 || (unchanged_iterations >= 2*min_required_stable)
+            % MODIFIED: Only converge if ALL tasks are assigned (remove the "or" condition)
+            if unassigned_count == 0 
                 converged = true;
                 if visualize
                     fprintf('Auction algorithm converged after %d iterations\n', iter);
                 end
                 break;
+            % NEW: If we have unassigned tasks but stable assignments, take action
+            elseif unchanged_iterations >= 2*min_required_stable
+                % NEW: Force price reduction for unassigned tasks
+                unassigned_tasks = find(auction_data.assignment == 0);
+                auction_data.prices(unassigned_tasks) = auction_data.prices(unassigned_tasks) * 0.5;
+                if visualize
+                    fprintf('WARNING: %d tasks remain unassigned after stable period. Reducing prices by 50%%.\n', unassigned_count);
+                end
+                % Reset stability counters to continue auction
+                unchanged_iterations = 0;
+                stable_workload_iterations = 0;
             end
         end
         
