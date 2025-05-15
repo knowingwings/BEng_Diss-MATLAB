@@ -263,7 +263,7 @@ function utils = enhanced_auction_utils()
                 auction_data.utilities(i, j) = single_bid - auction_data.prices(j);
                 
                 % Apply a penalty to the utility if this task has recently oscillated between robots
-                if auction_data.task_oscillation_count(j) > 3 && auction_data.task_last_robot(j) ~= i
+                if any(auction_data.task_oscillation_count(j) > 3) && any(auction_data.task_last_robot(j) ~= i)
                     auction_data.utilities(i, j) = auction_data.utilities(i, j) * 0.9;
                 end
                 
@@ -289,7 +289,7 @@ function utils = enhanced_auction_utils()
             % Select best tasks with positive utility - limited by batch size
             bid_count = 0;
             for j = sorted_tasks
-                if auction_data.utilities(i, j) > 0 && auction_data.assignment(j) ~= i
+                if any(auction_data.utilities(i, j)) > 0 && any(auction_data.assignment(j) ~= i)
                     % Message prioritization and persistence
                     % Implement resend attempts based on packet loss probability
                     resend_attempts = 0;
@@ -311,7 +311,7 @@ function utils = enhanced_auction_utils()
                         old_assignment = auction_data.assignment(j);
                         
                         % Track oscillation (robot changes) for this task
-                        if old_assignment > 0 && old_assignment ~= i
+                        if any(old_assignment > 0) && any(old_assignment ~= i)
                             auction_data.task_oscillation_count(j) = auction_data.task_oscillation_count(j) + 1;
                         end
                         auction_data.task_last_robot(j) = i;
@@ -824,6 +824,53 @@ function utils = enhanced_auction_utils()
         robot1 = 1;
         robot2 = 2;
         
+        % Calculate workloads for both robots (previously missing)
+        robot_workloads = zeros(1, length(robots));
+        for i = 1:length(robots)
+            if ~isfield(robots, 'failed') || ~robots(i).failed
+                for j = 1:length(tasks)
+                    if auction_data.assignment(j) == i
+                        if isfield(tasks, 'execution_time')
+                            try
+                                robot_workloads(i) = robot_workloads(i) + double(tasks(j).execution_time);
+                            catch
+                                robot_workloads(i) = robot_workloads(i) + 1;
+                            end
+                        else
+                            robot_workloads(i) = robot_workloads(i) + 1;
+                        end
+                    end
+                end
+            end
+        end
+        
+        % Calculate workload ratio
+        max_workload = max(robot_workloads);
+        workload_ratios = ones(1, length(robots));
+        if max_workload > 0
+            workload_ratios = robot_workloads / max_workload;
+        end
+        
+        % Calculate workload imbalance
+        active_robots = [];
+        for i = 1:length(robots)
+            if ~isfield(robots, 'failed') || ~robots(i).failed
+                active_robots = [active_robots, i];
+            end
+        end
+        
+        workload_imbalance = 0;
+        if length(active_robots) >= 2
+            active_workloads = robot_workloads(active_robots);
+            min_workload = min(active_workloads);
+            max_workload = max(active_workloads);
+            workload_diff = max_workload - min_workload;
+            
+            if max_workload > 0
+                workload_imbalance = workload_diff / max_workload;
+            end
+        end
+        
         % Determine leader/follower roles
         % Calculate leader cost for each robot
         cost1 = calculateLeaderCost(robot1, task_id, robots, tasks, auction_data);
@@ -838,9 +885,9 @@ function utils = enhanced_auction_utils()
             follower = robot1;
         end
         
-        % Calculate joint bid
-        leader_bid = calculateBid(leader, task_id, robot_workload(leader), workload_ratio(leader), workload_imbalance, auction_data, params, auction_data.utility_iter);
-        follower_bid = calculateBid(follower, task_id, robot_workload(follower), workload_ratio(follower), workload_imbalance, auction_data, params, auction_data.utility_iter);
+        % Calculate joint bid - using local variables now instead of undefined ones
+        leader_bid = calculateBid(leader, task_id, robot_workloads(leader), workload_ratios(leader), workload_imbalance, auction_data, params, auction_data.utility_iter);
+        follower_bid = calculateBid(follower, task_id, robot_workloads(follower), workload_ratios(follower), workload_imbalance, auction_data, params, auction_data.utility_iter);
         
         % Joint bid is the minimum of the two (limiting factor)
         joint_bid = min(leader_bid, follower_bid);
@@ -1190,7 +1237,7 @@ function [metrics, converged] = runEnhancedAuctionSimulation(params, env, robots
             metrics.makespan_before_failure = max(robot_loads);
             
             % Initiate recovery process for programmed failure
-            [auction_data, recovery_status] = initiateRecovery(auction_data, robots, tasks, params.failed_robot);
+            [auction_data, recovery_status] = utils.initiateRecovery(auction_data, robots, tasks, params.failed_robot);
             metrics.failure_time = iter;
         end
         
@@ -1199,7 +1246,7 @@ function [metrics, converged] = runEnhancedAuctionSimulation(params, env, robots
         
         % Handle any detected failures
         for i = 1:length(failures)
-            [auction_data, recovery_status] = initiateRecovery(auction_data, robots, tasks, failures(i));
+            [auction_data, recovery_status] = utils.initiateRecovery(auction_data, robots, tasks, failures(i));
             if visualize
                 fprintf('Recovery initiated for robot %d failures\n', failures(i));
                 

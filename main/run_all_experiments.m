@@ -53,18 +53,18 @@ function run_basic_convergence_test()
     % Run basic convergence test with different epsilon values
     
     % Load utility functions
-    enhanced_auction_utils = enhanced_auction_utils();
-    robot_utils = robot_utils();
-    task_utils = task_utils();
+    enhanced_auction_util = enhanced_auction_utils();
+    robot_util = robot_utils();
+    task_util = task_utils();
     env_utils = environment_utils();
     
     % Create environment and robots
     env = env_utils.createEnvironment(4, 4);
-    robots = robot_utils.createRobots(2, env);
+    robots = robot_util.createRobots(2, env);
     
     % Create tasks
     num_tasks = 10;
-    tasks = task_utils.createTasks(num_tasks, env);
+    tasks = task_util.createTasks(num_tasks, env);
     
     % Test different epsilon values
     epsilon_values = [0.01, 0.05, 0.1, 0.2];
@@ -89,7 +89,7 @@ function run_basic_convergence_test()
         params.failed_robot = [];
         
         % Run simulation
-        [metrics, converged] = enhanced_auction_utils.runAuctionSimulation(params, env, robots, tasks, false);
+        [metrics, converged] = enhanced_auction_util.runEnhancedAuctionSimulation(params, env, robots, tasks, false);
         
         % Store results
         results.iterations(i) = metrics.iterations;
