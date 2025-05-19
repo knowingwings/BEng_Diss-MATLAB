@@ -23,6 +23,10 @@ def main():
                        help='Enable visualization during simulations (slower)')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed for reproducibility')
+    parser.add_argument('--headless', action='store_true',
+                   help='Force headless mode for visualization')
+    parser.add_argument('--save-plot-data', action='store_true', default=True,
+                   help='Save plot data for remote visualization')
     args = parser.parse_args()
     
     # Set random seeds for reproducibility
@@ -53,15 +57,26 @@ def main():
         config = load_config(args.config)
         config['use_gpu'] = args.use_gpu
         config['visualize'] = args.visualize
+        config['headless'] = args.headless
+        config['save_plot_data'] = args.save_plot_data
+        # Add config file name to the configuration
+        config['config_file'] = args.config
         
+        # Create experiment runner
         runner = ExperimentRunner(config)
+        
+        # Run experiment
         results = runner.run_factorial_experiment(num_processes=args.processes)
-        runner.save_results(results, args.results)
+        
+        # Save results (runner will handle it)
+        results_path = runner.save_results(results)
         
         # Generate basic analysis automatically
         from core.analysis import analyze_results, generate_reports
-        analyze_results(args.results)
-        generate_reports(args.results)
+        analyze_results(results_path)
+        generate_reports(results_path, output_dir=runner.results_dir, 
+                        headless=config.get('headless', None),
+                        save_data=config.get('save_plot_data', True))
     
     elif args.mode == 'analysis':
         # Run analysis on existing results

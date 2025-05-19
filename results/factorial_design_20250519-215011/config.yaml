@@ -1,0 +1,45 @@
+analysis:
+  anova_significance: 0.05
+  confidence_level: 0.95
+  include_interactions: true
+  response_variables:
+  - makespan
+  - message_count
+  - optimality_gap
+  - recovery_time
+config_file: config/factorial_design.yaml
+experiment:
+  failure_probability: 0.5
+  failure_time_fraction: 0.3
+  num_runs: 30
+  random_seed: 42
+  robot_count: 2
+  simulation_time: 300
+  workspace_size:
+  - 4
+  - 4
+headless: true
+parameters:
+  comm_delay:
+  - 0
+  - 50
+  - 200
+  - 500
+  epsilon:
+  - 0.01
+  - 0.05
+  - 0.2
+  - 0.5
+  num_tasks:
+  - 4
+  - 8
+  - 16
+  - 32
+  packet_loss:
+  - 0
+  - 0.1
+  - 0.3
+  - 0.5
+save_plot_data: true
+use_gpu: true
+visualize: false

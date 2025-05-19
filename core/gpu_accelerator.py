@@ -1,35 +1,64 @@
 # core/gpu_accelerator.py
 import torch
 import numpy as np
+import os
 
 class GPUAccelerator:
-    """GPU acceleration for compute-intensive operations"""
+    """GPU acceleration with support for AMD GPU detected through CUDA compatibility"""
     
     def __init__(self):
-        """Initialize GPU accelerator, supporting both NVIDIA and AMD GPUs"""
-        # Check if GPU is available - specifically check for AMD GPUs with ROCm
-        if hasattr(torch, 'hip') and torch.hip.is_available():
-            self.device = torch.device('hip')
-            self.using_gpu = True
-            print(f"AMD GPU acceleration enabled: {torch.hip.get_device_name(0)}")
-        elif torch.cuda.is_available():
-            self.device = torch.device('cuda')
-            self.using_gpu = True
-            print(f"NVIDIA GPU acceleration enabled: {torch.cuda.get_device_name(0)}")
-        else:
+        """Initialize GPU accelerator for the unique configuration detected"""
+        self.using_gpu = False
+        self.device = torch.device('cpu')
+        self.is_amd_via_cuda = False
+        
+        try:
+            if torch.cuda.is_available():
+                # Check if this is actually an AMD GPU detected through CUDA
+                device_name = torch.cuda.get_device_name(0).lower()
+                if 'amd' in device_name or 'radeon' in device_name:
+                    self.is_amd_via_cuda = True
+                    print(f"AMD GPU detected through CUDA: {torch.cuda.get_device_name(0)}")
+                else:
+                    print(f"NVIDIA GPU detected: {torch.cuda.get_device_name(0)}")
+                
+                self.device = torch.device('cuda')
+                self.using_gpu = True
+                
+                # Set specific settings for AMD GPUs detected through CUDA
+                if self.is_amd_via_cuda:
+                    # Limit memory usage to avoid crashes
+                    torch.cuda.set_per_process_memory_fraction(0.7)
+            else:
+                print("No GPU detected, using CPU")
+                # Optimize CPU settings
+                torch.set_num_threads(torch.get_num_threads())
+                print(f"Using {torch.get_num_threads()} CPU threads")
+                
+        except Exception as e:
+            print(f"Error during GPU initialization: {e}")
+            print("Falling back to CPU")
             self.device = torch.device('cpu')
             self.using_gpu = False
-            print("GPU not available, using CPU")
         
         # Pre-allocate tensors for common operations
-        self.eye6 = torch.eye(6, device=self.device)
+        self.eye4 = torch.eye(4, device=self.device)
         
-        # Additional setup for ROCm/HIP if using AMD GPU
-        if self.using_gpu and hasattr(torch, 'hip'):
-            # Set memory allocation strategy optimized for AMD GPUs
-            if hasattr(torch.hip, 'memory_stats'):
-                print("Configuring ROCm memory allocator for optimal performance")
-        
+        # Verify GPU is working
+        if self.using_gpu:
+            try:
+                # Simple test tensor operation
+                test_tensor = torch.ones(10, device=self.device)
+                test_result = test_tensor + 1
+                # Check for numeric results (avoiding NaNs)
+                if torch.isnan(test_result).any():
+                    raise Exception("GPU produced NaN values")
+                print("GPU test successful")
+            except Exception as e:
+                print(f"GPU test failed: {e}")
+                self.device = torch.device('cpu')
+                self.using_gpu = False
+                print("Falling back to CPU")
     
     def to_tensor(self, array):
         """Convert numpy array to tensor on correct device"""
@@ -42,7 +71,7 @@ class GPUAccelerator:
         if isinstance(tensor, np.ndarray):
             return tensor
         return tensor.cpu().numpy()
-    
+        
     def calculate_bids_batch(self, robot_positions, robot_capabilities, task_positions, 
                           task_capabilities, workloads, weights):
         """Calculate bids for all robot-task combinations in a single batch operation
@@ -76,51 +105,89 @@ class GPUAccelerator:
         num_robots = r_pos.shape[0]
         num_tasks = t_pos.shape[0]
         
-        # Calculate distances (batch operation)
-        # Reshape for broadcasting: [num_robots, 1, 2] - [1, num_tasks, 2]
-        r_pos_expanded = r_pos.unsqueeze(1)
-        t_pos_expanded = t_pos.unsqueeze(0)
+        # Special handling for AMD GPUs via CUDA to prevent instability
+        if self.is_amd_via_cuda and (num_robots > 10 or num_tasks > 50):
+            # Break calculation into smaller chunks to avoid memory issues
+            # This is a simple approach - we could optimize this further if needed
+            chunk_size = 10
+            bids = torch.zeros((num_robots, num_tasks), device=self.device)
+            
+            for i in range(0, num_robots, chunk_size):
+                end_i = min(i + chunk_size, num_robots)
+                for j in range(0, num_tasks, chunk_size):
+                    end_j = min(j + chunk_size, num_tasks)
+                    
+                    # Process this chunk
+                    r_pos_chunk = r_pos[i:end_i]
+                    r_cap_chunk = r_cap[i:end_i]
+                    t_pos_chunk = t_pos[j:end_j]
+                    t_cap_chunk = t_cap[j:end_j]
+                    work_chunk = work[i:end_i]
+                    
+                    # Calculate distances for this chunk
+                    r_pos_expanded = r_pos_chunk.unsqueeze(1)
+                    t_pos_expanded = t_pos_chunk.unsqueeze(0)
+                    distances = torch.sqrt(torch.sum((r_pos_expanded - t_pos_expanded)**2, dim=2) + 1e-10)
+                    
+                    # Calculate terms
+                    distance_term = alpha1 / (distances + 1e-10)
+                    config_term = alpha2 * torch.ones((end_i-i, end_j-j), device=self.device)
+                    
+                    # Calculate capability similarity
+                    r_cap_norm = torch.norm(r_cap_chunk, dim=1, keepdim=True)
+                    t_cap_norm = torch.norm(t_cap_chunk, dim=1, keepdim=True)
+                    r_cap_expanded = r_cap_chunk.unsqueeze(1)
+                    t_cap_expanded = t_cap_chunk.unsqueeze(0)
+                    dot_products = torch.sum(r_cap_expanded * t_cap_expanded, dim=2)
+                    norms_product = r_cap_norm * t_cap_norm.t()
+                    similarity = dot_products / (norms_product + 1e-10)
+                    capability_term = alpha3 * similarity
+                    
+                    # Calculate workload term
+                    workload_term = alpha4 * work_chunk.unsqueeze(1).expand(-1, end_j-j)
+                    
+                    # Calculate chunk bids
+                    chunk_bids = distance_term + config_term + capability_term - workload_term
+                    bids[i:end_i, j:end_j] = chunk_bids
+                    
+                    # Free up memory
+                    torch.cuda.empty_cache()
+            
+            return bids
+        else:
+            # Standard calculation for CPU or stable GPU operations
+            # Calculate distances (batch operation)
+            r_pos_expanded = r_pos.unsqueeze(1)
+            t_pos_expanded = t_pos.unsqueeze(0)
+            distances = torch.sqrt(torch.sum((r_pos_expanded - t_pos_expanded)**2, dim=2) + 1e-10)
+            
+            # Calculate distance term
+            distance_term = alpha1 / (distances + 1e-10)
+            
+            # For simplification, we'll set configuration cost term as constant
+            config_term = alpha2 * torch.ones((num_robots, num_tasks), device=self.device)
+            
+            # Calculate capability similarity
+            r_cap_norm = torch.norm(r_cap, dim=1, keepdim=True)
+            t_cap_norm = torch.norm(t_cap, dim=1, keepdim=True)
+            r_cap_expanded = r_cap.unsqueeze(1)  # [num_robots, 1, cap_dim]
+            t_cap_expanded = t_cap.unsqueeze(0)  # [1, num_tasks, cap_dim]
+            dot_products = torch.sum(r_cap_expanded * t_cap_expanded, dim=2)
+            norms_product = r_cap_norm * t_cap_norm.t()
+            similarity = dot_products / (norms_product + 1e-10)
+            capability_term = alpha3 * similarity
+            
+            # Calculate workload term
+            workload_term = alpha4 * work.unsqueeze(1).expand(-1, num_tasks)
+            
+            # Calculate final bids
+            bids = distance_term + config_term + capability_term - workload_term
+            
+            return bids
         
-        # Calculate Euclidean distances: [num_robots, num_tasks]
-        distances = torch.sqrt(torch.sum((r_pos_expanded - t_pos_expanded)**2, dim=2) + 1e-10)
-        
-        # Calculate distance term (avoid division by zero with epsilon)
-        distance_term = alpha1 / (distances + 1e-10)
-        
-        # For simplification, we'll set configuration cost term as constant
-        # In a real implementation, you'd calculate this based on the configurations
-        config_term = alpha2 * torch.ones((num_robots, num_tasks), device=self.device)
-        
-        # Calculate capability similarity
-        # Normalize capabilities
-        r_cap_norm = torch.norm(r_cap, dim=1, keepdim=True)
-        t_cap_norm = torch.norm(t_cap, dim=1, keepdim=True)
-        
-        # Reshape for batch dot product
-        r_cap_expanded = r_cap.unsqueeze(1)  # [num_robots, 1, cap_dim]
-        t_cap_expanded = t_cap.unsqueeze(0)  # [1, num_tasks, cap_dim]
-        
-        # Calculate dot products
-        dot_products = torch.sum(r_cap_expanded * t_cap_expanded, dim=2)
-        
-        # Calculate similarity (cosine similarity)
-        norms_product = r_cap_norm * t_cap_norm.t()
-        similarity = dot_products / (norms_product + 1e-10)
-        
-        # Calculate capability term
-        capability_term = alpha3 * similarity
-        
-        # Calculate workload term
-        workload_term = alpha4 * work.unsqueeze(1).expand(-1, num_tasks)
-        
-        # Calculate final bids
-        bids = distance_term + config_term + capability_term - workload_term
-        
-        return bids
-    
     def run_auction_gpu(self, robot_positions, robot_capabilities, robot_statuses, 
-                  task_positions, task_capabilities, task_assignments, 
-                  epsilon, prices):
+                    task_positions, task_capabilities, task_assignments, 
+                    epsilon, prices):
         """Run distributed auction algorithm on GPU
         
         Args:
