@@ -1,0 +1,191 @@
+# decentralized_control/core/auction.py
+
+import numpy as np
+import time
+import random
+
+class DistributedAuction:
+    def __init__(self, epsilon=0.01, communication_delay=0, packet_loss_prob=0):
+        """Initialize distributed auction algorithm
+        
+        Args:
+            epsilon: Minimum bid increment (controls optimality gap and convergence)
+            communication_delay: Communication delay in ms
+            packet_loss_prob: Probability of packet loss (0-1)
+        """
+        self.epsilon = epsilon
+        self.communication_delay = communication_delay / 1000.0  # Convert ms to seconds
+        self.packet_loss_prob = packet_loss_prob
+        self.weights = {
+            'alpha1': 0.3,  # Distance weight
+            'alpha2': 0.2,  # Configuration cost weight
+            'alpha3': 0.3,  # Capability similarity weight
+            'alpha4': 0.1,  # Workload weight
+            'alpha5': 0.1,  # Energy consumption weight
+            'W': np.eye(6)  # Weight matrix for configuration
+        }
+        self.beta_weights = {
+            'beta1': 0.5,  # Progress weight
+            'beta2': 0.3,  # Criticality weight
+            'beta3': 0.2   # Urgency weight
+        }
+    
+    def run_auction(self, robots, tasks, task_graph):
+        """Run distributed auction algorithm for task allocation
+        
+        Args:
+            robots: List of Robot objects
+            tasks: List of Task objects
+            task_graph: TaskDependencyGraph object
+            
+        Returns:
+            tuple: (assignments dict, message count)
+        """
+        # Find unassigned tasks that are ready (prerequisites completed)
+        unassigned_tasks = [task for task in tasks 
+                           if task.assigned_to == 0 and 
+                           task.status == 'pending' and 
+                           task_graph.is_available(task.id)]
+        
+        if not unassigned_tasks:
+            return {}, 0  # No tasks to assign
+        
+        # Track assignments and prices
+        prices = {task.id: 0.0 for task in tasks}
+        assignments = {task.id: 0 for task in tasks}
+        messages_sent = 0
+        
+        # Run auction algorithm
+        iter_count = 0
+        max_iterations = 100  # Prevent infinite loops
+        
+        while unassigned_tasks and iter_count < max_iterations:
+            iter_count += 1
+            
+            # For each robot, calculate bids for unassigned tasks
+            for robot in robots:
+                # Skip failed robots
+                if robot.status != 'operational':
+                    continue
+                
+                # Calculate current workload
+                workload = sum(task.completion_time for task in tasks 
+                              if task.assigned_to == robot.id and
+                              task.status != 'completed')
+                robot.workload = workload
+                
+                # Find best task for this robot
+                best_utility = float('-inf')
+                best_task = None
+                best_bid = 0
+                
+                for task in unassigned_tasks:
+                    # Skip collaborative tasks for simplicity (these are handled separately)
+                    if task.collaborative:
+                        continue
+                    
+                    # Calculate bid
+                    bid = robot.calculate_bid(task, self.weights, workload)
+                    
+                    # Apply communication delay
+                    if self.communication_delay > 0:
+                        time.sleep(self.communication_delay)
+                    
+                    # Check for packet loss
+                    if random.random() < self.packet_loss_prob:
+                        continue  # Simulate packet loss
+                    
+                    messages_sent += 1
+                    
+                    # Calculate utility (bid - price)
+                    utility = bid - prices[task.id]
+                    
+                    if utility > best_utility:
+                        best_utility = utility
+                        best_task = task
+                        best_bid = bid
+                
+                # If found a task with positive utility, propose assignment
+                if best_task and best_utility > 0:
+                    # Update price
+                    prices[best_task.id] = prices[best_task.id] + self.epsilon + best_bid
+                    
+                    # Assign task to robot
+                    best_task.assigned_to = robot.id
+                    assignments[best_task.id] = robot.id
+                    
+                    # Remove from unassigned tasks
+                    unassigned_tasks.remove(best_task)
+                    
+                    messages_sent += 1  # Assignment message
+        
+        # Handle collaborative tasks (simplified)
+        collaborative_tasks = [task for task in tasks 
+                              if task.collaborative and task.assigned_to == 0 and
+                              task.status == 'pending' and
+                              task_graph.is_available(task.id)]
+        
+        for task in collaborative_tasks:
+            # Check if at least two robots are operational
+            operational_robots = [r for r in robots if r.status == 'operational']
+            if len(operational_robots) >= 2:
+                # For simplicity, assign to the first operational robot
+                # In a real system, this would require coordination
+                task.assigned_to = operational_robots[0].id
+                assignments[task.id] = operational_robots[0].id
+                messages_sent += 1
+        
+        return assignments, messages_sent
+    
+    def run_recovery_auction(self, operational_robots, failed_tasks, task_graph):
+        """Special auction for task reallocation after failure
+        
+        Args:
+            operational_robots: List of operational Robot objects
+            failed_tasks: List of Task objects that need reallocation
+            task_graph: TaskDependencyGraph object
+            
+        Returns:
+            tuple: (assignments dict, message count)
+        """
+        assignments = {}
+        messages_sent = 0
+        
+        for task in failed_tasks:
+            best_bid = float('-inf')
+            best_robot = None
+            
+            for robot in operational_robots:
+                # Calculate standard bid
+                standard_bid = robot.calculate_bid(task, self.weights, robot.workload)
+                
+                # Calculate task criticality (number of dependent tasks)
+                criticality = task_graph.get_task_criticality(task.id)
+                
+                # Calculate urgency
+                urgency = task.progress if task.status == 'in_progress' else 0
+                
+                # Calculate recovery bid
+                recovery_bid = robot.calculate_recovery_bid(standard_bid, task.progress, 
+                                                          criticality, urgency, 
+                                                          self.beta_weights)
+                
+                # Apply communication delay and check for packet loss
+                if self.communication_delay > 0:
+                    time.sleep(self.communication_delay)
+                
+                if random.random() < self.packet_loss_prob:
+                    continue  # Simulate packet loss
+                
+                messages_sent += 1
+                
+                if recovery_bid > best_bid:
+                    best_bid = recovery_bid
+                    best_robot = robot
+            
+            if best_robot:
+                task.assigned_to = best_robot.id
+                assignments[task.id] = best_robot.id
+                messages_sent += 1
+        
+        return assignments, messages_sent
