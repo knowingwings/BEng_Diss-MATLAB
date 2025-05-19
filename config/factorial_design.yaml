@@ -1,19 +1,21 @@
-# decentralized_control/config/factorial_design.yaml
+# Updated factorial_design.yaml
 parameters:
-  num_tasks: [4, 8, 16, 32]
-  comm_delay: [0, 50, 200, 500]  # ms
-  packet_loss: [0, 0.1, 0.3, 0.5]
-  epsilon: [0.01, 0.05, 0.2, 0.5]
+  num_tasks: [4, 8, 16, 32]  # Matches Table 2
+  comm_delay: [0, 50, 200, 500]  # ms - Matches Table 2
+  packet_loss: [0, 0.1, 0.3, 0.5]  # Matches Table 2
+  epsilon: [0.01, 0.05, 0.2, 0.5]  # Matches Table 2
 
 experiment:
-  num_runs: 10  # Number of repetitions per configuration
+  num_runs: 30 
   simulation_time: 300  # seconds
-  robot_count: 2
-  workspace_size: [10, 8]
+  robot_count: 2  
+  workspace_size: [4, 4] #4x4 meters
   random_seed: 42
   failure_probability: 0.5  # Probability of injecting a failure
+  failure_time_fraction: 0.3  # Inject failure at 30% of max simulation time
   
 analysis:
-  confidence_level: 0.95
-  anova_significance: 0.05
-  include_interactions: trues
+  confidence_level: 0.95  # 95% confidence intervals as specified in methodology
+  anova_significance: 0.05  # p < 0.05 as specified in methodology
+  include_interactions: true  # Fixed typo from "trues"
+  response_variables: ["makespan", "message_count", "optimality_gap", "recovery_time"]

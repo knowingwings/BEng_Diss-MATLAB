@@ -3,28 +3,35 @@ import numpy as np
 
 class Robot:
     def __init__(self, robot_id, position, orientation, config=None, capabilities=None):
-        """Initialize a robot with given parameters
+        """Initialize a robot with parameters matching TurtleBot3 Waffle Pi with OpenMANIPULATOR-X
         
         Args:
             robot_id: Unique identifier for the robot
             position: Initial position as [x, y] array
             orientation: Initial orientation in radians
-            config: Initial joint configuration (6-DOF manipulator)
+            config: Initial joint configuration (4-DOF manipulator + gripper)
             capabilities: Capability vector describing robot abilities
         """
         self.id = robot_id
         self.position = np.array(position, dtype=float)
         self.orientation = float(orientation)
-        self.config = np.zeros(6) if config is None else np.array(config)
+        # Reduced from 6-DOF to 4-DOF + gripper to match OpenMANIPULATOR-X
+        self.config = np.zeros(5) if config is None else np.array(config)
         self.capabilities = np.random.rand(5) if capabilities is None else np.array(capabilities)
         self.status = 'operational'  # 'operational', 'failed', 'partial_failure'
         self.workload = 0
         self.assigned_tasks = []
         self.trajectory = [np.copy(position)]  # Store trajectory for visualization
         
-        # Kinematics parameters
-        self.max_linear_velocity = 0.5  # m/s
-        self.max_angular_velocity = 1.0  # rad/s
+        # Kinematics parameters - Updated to match TurtleBot3 Waffle Pi
+        self.max_linear_velocity = 0.26  # m/s (reduced from 0.5 to match platform)
+        self.max_angular_velocity = 1.82  # rad/s (updated from 1.0 to match platform)
+        self.base_dimensions = [0.281, 0.306]  # width, length in meters
+        self.manipulator_reach = 0.380  # meters (reduced from 0.85m)
+        self.manipulator_payload = 0.5  # kg (reduced from 5kg)
+        
+        # Virtual F/T sensor for force-controlled operations
+        self.ft_sensor = {'force': np.zeros(3), 'torque': np.zeros(3)}
         
         # For visualization
         self.color = 'blue'
@@ -65,9 +72,12 @@ class Robot:
         dy = self.position[1] - task.position[1]
         distance = (dx*dx + dy*dy)**0.5
         
-        # Calculate configuration transition cost
-        config_diff = self.config - task.required_config
-        config_cost = np.sqrt(config_diff.T @ W @ config_diff)
+        # Calculate configuration transition cost - adapted for 4-DOF manipulator
+        # Use only first 4 components for configuration to match OpenMANIPULATOR-X
+        config_diff = self.config[:4] - task.required_config[:4]
+        # Ensure W matrix is properly sized for 4-DOF
+        W_sub = W[:4,:4] if W.shape[0] > 4 else W
+        config_cost = np.sqrt(config_diff.T @ W_sub @ config_diff)
         
         # Calculate capability similarity
         robot_cap_norm = np.linalg.norm(self.capabilities)
@@ -182,3 +192,13 @@ class Robot:
     def reset_trajectory(self):
         """Reset stored trajectory"""
         self.trajectory = [np.copy(self.position)]
+        
+    def update_ft_sensor(self, force, torque):
+        """Update virtual force/torque sensor readings
+        
+        Args:
+            force: 3D force vector [fx, fy, fz]
+            torque: 3D torque vector [tx, ty, tz]
+        """
+        self.ft_sensor['force'] = np.array(force)
+        self.ft_sensor['torque'] = np.array(torque)

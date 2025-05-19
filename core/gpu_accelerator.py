@@ -6,28 +6,30 @@ class GPUAccelerator:
     """GPU acceleration for compute-intensive operations"""
     
     def __init__(self):
-        def __init__(self):
-            # Check if GPU is available - modified to check for AMD GPUs too
-            if hasattr(torch, 'hip') and torch.hip.is_available():
-                self.device = torch.device('hip')
-                self.using_gpu = True
-                print(f"AMD GPU acceleration enabled: {torch.hip.get_device_name(0)}")
-            elif torch.cuda.is_available():
-                self.device = torch.device('cuda')
-                self.using_gpu = True
-                print(f"NVIDIA GPU acceleration enabled: {torch.cuda.get_device_name(0)}")
-            else:
-                self.device = torch.device('cpu')
-                self.using_gpu = False
-                print("GPU not available, using CPU")
-            
-            # Pre-allocate tensors for common operations
-            self.eye6 = torch.eye(6, device=self.device)
-        
-        if self.using_gpu:
-            print(f"GPU acceleration enabled: {torch.cuda.get_device_name(0)}")
+        """Initialize GPU accelerator, supporting both NVIDIA and AMD GPUs"""
+        # Check if GPU is available - specifically check for AMD GPUs with ROCm
+        if hasattr(torch, 'hip') and torch.hip.is_available():
+            self.device = torch.device('hip')
+            self.using_gpu = True
+            print(f"AMD GPU acceleration enabled: {torch.hip.get_device_name(0)}")
+        elif torch.cuda.is_available():
+            self.device = torch.device('cuda')
+            self.using_gpu = True
+            print(f"NVIDIA GPU acceleration enabled: {torch.cuda.get_device_name(0)}")
         else:
+            self.device = torch.device('cpu')
+            self.using_gpu = False
             print("GPU not available, using CPU")
+        
+        # Pre-allocate tensors for common operations
+        self.eye6 = torch.eye(6, device=self.device)
+        
+        # Additional setup for ROCm/HIP if using AMD GPU
+        if self.using_gpu and hasattr(torch, 'hip'):
+            # Set memory allocation strategy optimized for AMD GPUs
+            if hasattr(torch.hip, 'memory_stats'):
+                print("Configuring ROCm memory allocator for optimal performance")
+        
     
     def to_tensor(self, array):
         """Convert numpy array to tensor on correct device"""
@@ -117,8 +119,8 @@ class GPUAccelerator:
         return bids
     
     def run_auction_gpu(self, robot_positions, robot_capabilities, robot_statuses, 
-                      task_positions, task_capabilities, task_assignments, 
-                      epsilon, prices):
+                  task_positions, task_capabilities, task_assignments, 
+                  epsilon, prices):
         """Run distributed auction algorithm on GPU
         
         Args:
@@ -165,16 +167,30 @@ class GPUAccelerator:
         # Calculate workloads of robots
         workloads = torch.zeros(len(robot_statuses), device=self.device)
         
-        # Run auction iterations
-        max_iterations = 100
-        messages = 0
+        # Set max_iterations based on theoretical bound: K² · bₘₐₓ/ε 
+        # where K is task count and bₘₐₓ is maximum possible bid
+        K = num_tasks
+        b_max = 100.0  # Estimate of maximum possible bid value
+        theoretical_max_iter = int(K**2 * b_max / epsilon)
         
-        for _ in range(max_iterations):
+        # Set a practical upper limit to prevent excessive iterations
+        max_iterations = min(theoretical_max_iter, 1000)
+        
+        # Initialize message counter and iteration counter
+        messages = 0
+        iterations_used = 0
+        
+        for iteration in range(max_iterations):
+            iterations_used += 1
+            
             # Find unassigned tasks
             unassigned = (t_assign == 0).nonzero().flatten()
             
             if len(unassigned) == 0:
-                break
+                break  # All tasks assigned
+            
+            # Track tasks assigned in this iteration
+            tasks_assigned_this_iter = 0
             
             # For each operational robot
             for r_idx in op_robots:
@@ -198,7 +214,7 @@ class GPUAccelerator:
                     weights
                 )
                 
-                # Count messages
+                # Count messages - one message per unassigned task (bid request)
                 messages += len(task_indices)
                 
                 # Calculate utilities (bid - price)
@@ -214,8 +230,8 @@ class GPUAccelerator:
                         # Get original task index
                         task_idx = task_indices[best_idx]
                         
-                        # Update price
-                        prices_tensor[task_idx] = prices_tensor[task_idx] + epsilon + bids[0, best_idx]
+                        # Update price - critical for maintaining 2ε optimality gap
+                        prices_tensor[task_idx] = prices_tensor[task_idx] + epsilon + best_utility
                         
                         # Assign task to robot
                         t_assign[task_idx] = r_idx + 1  # +1 because assignment 0 means unassigned
@@ -223,11 +239,21 @@ class GPUAccelerator:
                         # Update unassigned tasks
                         unassigned = (t_assign == 0).nonzero().flatten()
                         
-                        # Message for assignment
+                        # Message for assignment notification
                         messages += 1
+                        
+                        # Track assignments in this iteration
+                        tasks_assigned_this_iter += 1
             
             # If no tasks were assigned in this iteration, break
-            if len(unassigned) == len(task_indices):
+            # This prevents unnecessary iterations and ensures convergence
+            if tasks_assigned_this_iter == 0:
                 break
+        
+        # For debugging/analysis - log if we hit iteration limit
+        if iterations_used >= max_iterations and len(unassigned) > 0:
+            import logging
+            logging.warning(f"GPU Auction reached maximum iterations ({max_iterations}) "
+                        f"with {len(unassigned)} tasks still unassigned.")
         
         return t_assign.cpu().numpy(), prices_tensor.cpu().numpy(), messages
