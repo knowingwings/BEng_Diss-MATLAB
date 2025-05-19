@@ -1,17 +1,20 @@
-# decentralized_control/core/auction.py
-
+# core/auction.py
 import numpy as np
 import time
 import random
+import torch
+
+from core.gpu_accelerator import GPUAccelerator
 
 class DistributedAuction:
-    def __init__(self, epsilon=0.01, communication_delay=0, packet_loss_prob=0):
+    def __init__(self, epsilon=0.01, communication_delay=0, packet_loss_prob=0, use_gpu=True):
         """Initialize distributed auction algorithm
         
         Args:
             epsilon: Minimum bid increment (controls optimality gap and convergence)
             communication_delay: Communication delay in ms
             packet_loss_prob: Probability of packet loss (0-1)
+            use_gpu: Whether to use GPU acceleration when available
         """
         self.epsilon = epsilon
         self.communication_delay = communication_delay / 1000.0  # Convert ms to seconds
@@ -29,6 +32,16 @@ class DistributedAuction:
             'beta2': 0.3,  # Criticality weight
             'beta3': 0.2   # Urgency weight
         }
+        
+        # Initialize GPU accelerator if requested
+        self.use_gpu = use_gpu
+        if use_gpu:
+            try:
+                self.gpu = GPUAccelerator()
+                self.use_gpu = self.gpu.using_gpu
+            except Exception as e:
+                print(f"Could not initialize GPU acceleration: {e}")
+                self.use_gpu = False
     
     def run_auction(self, robots, tasks, task_graph):
         """Run distributed auction algorithm for task allocation
@@ -49,7 +62,50 @@ class DistributedAuction:
         
         if not unassigned_tasks:
             return {}, 0  # No tasks to assign
+            
+        # Use GPU implementation if enabled and possible
+        if self.use_gpu and len(robots) > 0 and len(unassigned_tasks) > 0:
+            return self._run_auction_gpu(robots, unassigned_tasks, tasks)
+        else:
+            return self._run_auction_cpu(robots, unassigned_tasks, tasks)
+    
+    def _run_auction_gpu(self, robots, unassigned_tasks, all_tasks):
+        """GPU-accelerated auction implementation"""
+        # Prepare data for GPU processing
+        robot_positions = np.array([robot.position for robot in robots])
+        robot_capabilities = np.array([robot.capabilities for robot in robots])
+        robot_statuses = [robot.status for robot in robots]
         
+        task_positions = np.array([task.position for task in unassigned_tasks])
+        task_capabilities = np.array([task.capabilities for task in unassigned_tasks])
+        
+        # Map unassigned tasks to their indices in all_tasks
+        task_id_to_idx = {task.id: i for i, task in enumerate(unassigned_tasks)}
+        
+        # Current assignments and prices
+        task_assignments = np.zeros(len(unassigned_tasks), dtype=np.int32)
+        prices = np.zeros(len(unassigned_tasks), dtype=np.float32)
+        
+        # Run GPU auction
+        new_assignments, new_prices, messages = self.gpu.run_auction_gpu(
+            robot_positions, robot_capabilities, robot_statuses,
+            task_positions, task_capabilities, task_assignments,
+            self.epsilon, prices
+        )
+        
+        # Convert results back to dictionary format
+        assignments = {}
+        for i, task in enumerate(unassigned_tasks):
+            robot_idx = new_assignments[i]
+            if robot_idx > 0:  # If assigned
+                robot_id = robots[robot_idx-1].id
+                task.assigned_to = robot_id
+                assignments[task.id] = robot_id
+        
+        return assignments, messages
+    
+    def _run_auction_cpu(self, robots, unassigned_tasks, tasks):
+        """Original CPU implementation"""
         # Track assignments and prices
         prices = {task.id: 0.0 for task in tasks}
         assignments = {task.id: 0 for task in tasks}
@@ -80,7 +136,7 @@ class DistributedAuction:
                 best_bid = 0
                 
                 for task in unassigned_tasks:
-                    # Skip collaborative tasks for simplicity (these are handled separately)
+                    # Skip collaborative tasks for simplicity
                     if task.collaborative:
                         continue
                     
@@ -122,8 +178,7 @@ class DistributedAuction:
         # Handle collaborative tasks (simplified)
         collaborative_tasks = [task for task in tasks 
                               if task.collaborative and task.assigned_to == 0 and
-                              task.status == 'pending' and
-                              task_graph.is_available(task.id)]
+                              task.status == 'pending']
         
         for task in collaborative_tasks:
             # Check if at least two robots are operational
@@ -151,6 +206,39 @@ class DistributedAuction:
         assignments = {}
         messages_sent = 0
         
+        # Use GPU acceleration for recovery when possible
+        if self.use_gpu and len(operational_robots) > 0 and len(failed_tasks) > 0:
+            # Prepare data structures for GPU processing
+            robot_positions = np.array([robot.position for robot in operational_robots])
+            robot_capabilities = np.array([robot.capabilities for robot in operational_robots])
+            robot_statuses = ['operational'] * len(operational_robots)
+            
+            task_positions = np.array([task.position for task in failed_tasks])
+            task_capabilities = np.array([task.capabilities for task in failed_tasks])
+            
+            # Current assignments and prices
+            task_assignments = np.zeros(len(failed_tasks), dtype=np.int32)
+            prices = np.zeros(len(failed_tasks), dtype=np.float32)
+            
+            # Run GPU auction with parameters adjusted for recovery
+            new_assignments, _, messages = self.gpu.run_auction_gpu(
+                robot_positions, robot_capabilities, robot_statuses,
+                task_positions, task_capabilities, task_assignments,
+                self.epsilon * 2,  # Higher epsilon for faster convergence in recovery
+                prices
+            )
+            
+            # Process results
+            for i, task in enumerate(failed_tasks):
+                robot_idx = new_assignments[i]
+                if robot_idx > 0:  # If assigned
+                    robot_id = operational_robots[robot_idx-1].id
+                    task.assigned_to = robot_id
+                    assignments[task.id] = robot_id
+            
+            return assignments, messages
+        
+        # Fall back to CPU implementation
         for task in failed_tasks:
             best_bid = float('-inf')
             best_robot = None
