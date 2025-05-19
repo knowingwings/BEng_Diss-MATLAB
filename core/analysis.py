@@ -1,5 +1,4 @@
-# decentralized_control/core/analysis.py
-
+# core/analysis.py
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt

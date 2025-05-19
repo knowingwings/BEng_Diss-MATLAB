@@ -1,14 +1,13 @@
-# decentralized_control/core/experiment_runner.py
-
+# core/experiment_runner.py
 import numpy as np
 import pandas as pd
-from itertools import product
-from tqdm import tqdm
+import os
 import time
 import pickle
-import os
-import multiprocessing as mp
 import random
+from itertools import product
+from tqdm import tqdm
+import multiprocessing as mp
 
 from core.simulator import Simulator
 from core.centralized_solver import CentralizedSolver
@@ -18,7 +17,7 @@ class ExperimentRunner:
         """Initialize experiment runner
         
         Args:
-            config: Experiment configuration 
+            config: Experiment configuration dictionary
         """
         self.config = config
         self.results_dir = 'results'
@@ -28,7 +27,7 @@ class ExperimentRunner:
         """Run full factorial experiment based on control variables
         
         Args:
-            num_processes: Number of processes for parallel execution (None for serial)
+            num_processes: Number of processes for parallel execution (None for auto)
             
         Returns:
             pd.DataFrame: Results dataframe
@@ -55,18 +54,27 @@ class ExperimentRunner:
         print(f"Running {len(full_combinations)} experiments "
               f"({len(param_combinations)} parameter combinations x {num_runs} runs)...")
         
-        # Set up multiprocessing pool if requested
-        if num_processes:
-            pool = mp.Pool(processes=num_processes)
-            results = list(tqdm(pool.imap(self._run_experiment_config, full_combinations), 
-                               total=len(full_combinations)))
-            pool.close()
-            pool.join()
-        else:
-            # Serial execution
-            results = []
-            for combo in tqdm(full_combinations):
-                results.append(self._run_experiment_config(combo))
+        # Use maximum processes by default (all available cores)
+        if num_processes is None:
+            num_processes = os.cpu_count()
+            # Reserve 1 core for system if we have 8+ cores
+            if num_processes >= 8:
+                num_processes -= 1
+        
+        print(f"Using {num_processes} parallel processes")
+        
+        # Set up multiprocessing pool
+        # Use 'spawn' for Windows compatibility
+        ctx = mp.get_context('spawn')
+        
+        with ctx.Pool(processes=num_processes) as pool:
+            # Use larger chunksize for better CPU utilization with many short tasks
+            chunksize = max(1, len(full_combinations) // (num_processes * 10))
+            
+            results = list(tqdm(pool.imap(self._run_experiment_config, 
+                                         full_combinations,
+                                         chunksize=chunksize), 
+                              total=len(full_combinations)))
         
         # Combine results into DataFrame
         results_df = pd.DataFrame(results)
@@ -120,7 +128,8 @@ class ExperimentRunner:
             workspace_size=self.config['experiment']['workspace_size'],
             comm_delay=comm_delay,
             packet_loss=packet_loss,
-            epsilon=epsilon
+            epsilon=epsilon,
+            use_gpu=self.config.get('use_gpu', False)
         )
         
         # Generate random tasks
@@ -136,7 +145,8 @@ class ExperimentRunner:
         simulation_results = simulator.run_simulation(
             self.config['experiment']['simulation_time'],
             inject_failure=self.config['experiment'].get('failure_probability', 0) > 0,
-            failure_time_fraction=0.3
+            failure_time_fraction=0.3,
+            visualize=self.config.get('visualize', False)
         )
         execution_time = time.time() - start_time
         

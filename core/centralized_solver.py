@@ -1,5 +1,4 @@
-# decentralized_control/core/centralized_solver.py
-
+# core/centralized_solver.py
 import numpy as np
 import itertools
 from tqdm import tqdm

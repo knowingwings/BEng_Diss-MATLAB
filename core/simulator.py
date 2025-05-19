@@ -1,5 +1,4 @@
-# decentralized_control/core/simulator.py
-
+# core/simulator.py
 import numpy as np
 import time
 import random
@@ -12,7 +11,7 @@ from core.task import Task, TaskDependencyGraph
 from core.auction import DistributedAuction
 
 class Simulator:
-    def __init__(self, num_robots=2, workspace_size=(10, 8), comm_delay=0, packet_loss=0, epsilon=0.01):
+    def __init__(self, num_robots=2, workspace_size=(10, 8), comm_delay=0, packet_loss=0, epsilon=0.01, use_gpu=False):
         """Initialize simulator
         
         Args:
@@ -21,6 +20,7 @@ class Simulator:
             comm_delay: Communication delay in ms
             packet_loss: Probability of packet loss
             epsilon: Minimum bid increment for auction algorithm
+            use_gpu: Whether to use GPU acceleration
         """
         self.workspace_size = workspace_size
         self.sim_time = 0.0
@@ -28,6 +28,7 @@ class Simulator:
         self.comm_delay = comm_delay
         self.packet_loss = packet_loss
         self.epsilon = epsilon
+        self.use_gpu = use_gpu
         
         # Initialize robots
         self.robots = []
@@ -40,7 +41,7 @@ class Simulator:
         self.task_graph = None
         
         # Initialize auction algorithm
-        self.auction = DistributedAuction(epsilon, comm_delay, packet_loss)
+        self.auction = DistributedAuction(epsilon, comm_delay, packet_loss, use_gpu=use_gpu)
         
         # Initialize metrics
         self.metrics = {
@@ -56,6 +57,9 @@ class Simulator:
         
         # For visualization
         self.event_log = []
+        
+        # Track metrics history for visualization
+        self.metrics_history = []
     
     def generate_random_tasks(self, num_tasks):
         """Generate random tasks with random dependencies
@@ -163,13 +167,14 @@ class Simulator:
             return recovery_time
         return 0.0
     
-    def run_simulation(self, max_time, inject_failure=True, failure_time_fraction=0.3):
-        """Run simulation for specified time
+    def run_simulation(self, max_time, inject_failure=True, failure_time_fraction=0.3, visualize=False):
+        """Run simulation for specified time with performance optimizations
         
         Args:
             max_time: Maximum simulation time
             inject_failure: Whether to inject a robot failure
             failure_time_fraction: When to inject failure (fraction of max_time)
+            visualize: Whether to update visualization during simulation
             
         Returns:
             dict: Simulation metrics
@@ -178,9 +183,10 @@ class Simulator:
         step_count = 0
         self.metrics['message_count'] = 0
         
-        # Reset trajectories
-        for robot in self.robots:
-            robot.reset_trajectory()
+        # Reset trajectories if visualizing
+        if visualize:
+            for robot in self.robots:
+                robot.reset_trajectory()
         
         # Track when failures were injected and recovered
         failure_time = None
@@ -190,17 +196,43 @@ class Simulator:
         # For progress bar
         progress = tqdm(total=int(max_time/self.dt), desc="Simulation")
         
+        # Precompute task indices and create numpy arrays for faster access
+        task_indices = np.array([task.id for task in self.tasks])
+        task_positions = np.array([task.position for task in self.tasks])
+        
+        # Store task status as integer codes for faster checking
+        status_codes = {'pending': 0, 'in_progress': 1, 'completed': 2, 'failed': 3}
+        task_statuses = np.array([status_codes.get(task.status, 0) for task in self.tasks])
+        task_assignments = np.array([task.assigned_to for task in self.tasks])
+        
+        # Reset metrics history
+        self.metrics_history = []
+        
         while self.sim_time < max_time:
-            # Run auction if needed (unassigned tasks exist)
-            unassigned_exist = any(task.assigned_to == 0 and task.status == 'pending' 
-                                 for task in self.tasks)
+            # Check if any unassigned tasks exist
+            unassigned_mask = (task_assignments == 0) & (task_statuses == 0)
             
-            if unassigned_exist:
-                _, messages = self.auction.run_auction(self.robots, self.tasks, self.task_graph)
-                self.metrics['message_count'] += messages
+            if np.any(unassigned_mask):
+                # Periodic auction instead of every step (every 5 steps)
+                if step_count % 5 == 0:
+                    # Get unassigned task IDs
+                    unassigned_ids = task_indices[unassigned_mask]
+                    
+                    # Filter to those that are available (prerequisites completed)
+                    unassigned_tasks = [task for task in self.tasks 
+                                     if task.id in unassigned_ids and
+                                     self.task_graph.is_available(task.id)]
+                    
+                    if unassigned_tasks:
+                        # Run auction
+                        _, messages = self.auction.run_auction(self.robots, self.tasks, self.task_graph)
+                        self.metrics['message_count'] += messages
+                        
+                        # Update task assignments array
+                        task_assignments = np.array([task.assigned_to for task in self.tasks])
             
-            # Update task progress
-            for task in self.tasks:
+            # Update task progress - vectorized operations where possible
+            for i, task in enumerate(self.tasks):
                 if task.status == 'in_progress':
                     task.progress += self.dt / task.completion_time
                     
@@ -210,29 +242,59 @@ class Simulator:
                         task.update_status('completed')
                         task.completion_time_actual = self.sim_time - task.start_time
                         
-                        self.log_event(f"Task {task.id} completed at t={self.sim_time:.1f}s")
-            
-            # Move robots toward assigned tasks
-            for robot in self.robots:
-                if robot.status != 'operational':
-                    continue
-                    
-                # Find assigned tasks for this robot
-                assigned_tasks = [task for task in self.tasks 
-                                if task.assigned_to == robot.id and 
-                                task.status == 'pending']
-                
-                if assigned_tasks:
-                    # Move toward first pending task
-                    target_task = assigned_tasks[0]
-                    reached = robot.update_position(target_task.position, self.dt)
-                    
-                    # If reached task, start executing
-                    if reached and target_task.status == 'pending':
-                        target_task.update_status('in_progress')
-                        target_task.start_time = self.sim_time
+                        # Update status in array
+                        task_statuses[i] = status_codes['completed']
                         
-                        self.log_event(f"Robot {robot.id} started Task {target_task.id} at t={self.sim_time:.1f}s")
+                        # No need to log events when not visualizing
+                        if visualize:
+                            self.log_event(f"Task {task.id} completed at t={self.sim_time:.1f}s")
+            
+            # Only update robot positions if we're not in pure simulation mode
+            if visualize:
+                # Move robots toward assigned tasks
+                for robot in self.robots:
+                    if robot.status != 'operational':
+                        continue
+                        
+                    # Find assigned tasks for this robot
+                    assigned_mask = (task_assignments == robot.id) & (task_statuses == 0)
+                    
+                    if np.any(assigned_mask):
+                        # Get first pending task's position
+                        target_idx = np.where(assigned_mask)[0][0]
+                        target_task = self.tasks[target_idx]
+                        
+                        reached = robot.update_position(target_task.position, self.dt)
+                        
+                        # If reached task, start executing
+                        if reached and target_task.status == 'pending':
+                            target_task.update_status('in_progress')
+                            target_task.start_time = self.sim_time
+                            
+                            # Update status in array
+                            task_statuses[target_idx] = status_codes['in_progress']
+                            
+                            if visualize:
+                                self.log_event(f"Robot {robot.id} started Task {target_task.id} at t={self.sim_time:.1f}s")
+            else:
+                # Fast path for simulation-only mode
+                # Directly assign tasks without moving robots
+                for robot in self.robots:
+                    if robot.status != 'operational':
+                        continue
+                    
+                    # Find assigned pending tasks for this robot
+                    assigned_mask = (task_assignments == robot.id) & (task_statuses == 0)
+                    
+                    if np.any(assigned_mask):
+                        # Get indices of assigned pending tasks
+                        task_indices_to_start = np.where(assigned_mask)[0]
+                        
+                        # Start executing all assigned tasks immediately
+                        for idx in task_indices_to_start:
+                            self.tasks[idx].update_status('in_progress')
+                            self.tasks[idx].start_time = self.sim_time
+                            task_statuses[idx] = status_codes['in_progress']
             
             # Inject robot failure if configured
             if inject_failure and self.sim_time >= max_time*failure_time_fraction and not failure_time:
@@ -252,30 +314,41 @@ class Simulator:
             step_count += 1
             progress.update(1)
             
-            # Calculate workload balance
-            workloads = [r.workload for r in self.robots if r.status == 'operational']
-            if workloads:
-                max_workload = max(workloads)
-                min_workload = min(workloads)
-                if max_workload > 0:
-                    self.metrics['workload_balance'] = 1 - (max_workload - min_workload) / max_workload
-                else:
-                    self.metrics['workload_balance'] = 1
-            
-            # Calculate completion rate
-            total_tasks = len(self.tasks)
-            completed_tasks = sum(1 for task in self.tasks if task.status == 'completed')
-            self.metrics['completion_rate'] = completed_tasks / total_tasks if total_tasks > 0 else 0
-            
-            # Exit early if all tasks completed
-            if completed_tasks == total_tasks:
-                self.log_event(f"All tasks completed at t={self.sim_time:.1f}s")
-                break
+            # Calculate workload balance (only periodically to save time)
+            if step_count % 10 == 0:
+                workloads = [r.workload for r in self.robots if r.status == 'operational']
+                if workloads:
+                    max_workload = max(workloads)
+                    min_workload = min(workloads)
+                    if max_workload > 0:
+                        self.metrics['workload_balance'] = 1 - (max_workload - min_workload) / max_workload
+                    else:
+                        self.metrics['workload_balance'] = 1
+                
+                # Calculate completion rate
+                completed_count = np.sum(task_statuses == status_codes['completed'])
+                total_tasks = len(self.tasks)
+                self.metrics['completion_rate'] = completed_count / total_tasks if total_tasks > 0 else 0
+                
+                # Store metrics history point
+                self.metrics_history.append({
+                    'time': self.sim_time,
+                    'completion_rate': self.metrics['completion_rate'],
+                    'workload_balance': self.metrics['workload_balance'],
+                    'message_count': self.metrics['message_count']
+                })
+                
+                # Exit early if all tasks completed
+                if completed_count == total_tasks:
+                    if visualize:
+                        self.log_event(f"All tasks completed at t={self.sim_time:.1f}s")
+                    break
         
         progress.close()
         
         # Calculate makespan (time of last task completion or simulation end)
-        completion_times = [task.completion_time_actual for task in self.tasks if task.completion_time_actual is not None]
+        completion_times = [task.completion_time_actual for task in self.tasks 
+                           if task.completion_time_actual is not None]
         if completion_times:
             self.metrics['makespan'] = max(completion_times)
         else:

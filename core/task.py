@@ -1,203 +1,279 @@
-# decentralized_control/core/task.py
-
+# core/auction.py
 import numpy as np
-import networkx as nx
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
+import time
+import random
+import torch
 
-class Task:
-    def __init__(self, task_id, position, capabilities=None, completion_time=None, 
-                 prerequisites=None, collaborative=False):
-        """Initialize a task with given parameters
+from core.gpu_accelerator import GPUAccelerator
+
+class DistributedAuction:
+    def __init__(self, epsilon=0.01, communication_delay=0, packet_loss_prob=0, use_gpu=True):
+        """Initialize distributed auction algorithm
         
         Args:
-            task_id: Unique identifier for the task
-            position: Position as [x, y] array
-            capabilities: Required capabilities for this task
-            completion_time: Time to complete the task (seconds)
-            prerequisites: List of task IDs that must be completed before this task
-            collaborative: Whether this task requires collaboration
+            epsilon: Minimum bid increment (controls optimality gap and convergence)
+            communication_delay: Communication delay in ms
+            packet_loss_prob: Probability of packet loss (0-1)
+            use_gpu: Whether to use GPU acceleration when available
         """
-        self.id = task_id
-        self.position = np.array(position, dtype=float)
-        self.capabilities = np.random.rand(5) if capabilities is None else np.array(capabilities)
-        self.completion_time = 5.0 if completion_time is None else float(completion_time)
-        self.prerequisites = [] if prerequisites is None else list(prerequisites)
-        self.collaborative = bool(collaborative)
-        self.assigned_to = 0  # 0 = unassigned, otherwise robot ID
-        self.progress = 0.0
-        self.status = 'pending'  # 'pending', 'in_progress', 'completed', 'failed'
-        self.required_config = np.random.rand(6)  # Random required configuration
-        self.start_time = None
-        self.completion_time_actual = None
-        self.color = 'black'  # For visualization
+        self.epsilon = epsilon
+        self.communication_delay = communication_delay / 1000.0  # Convert ms to seconds
+        self.packet_loss_prob = packet_loss_prob
+        self.weights = {
+            'alpha1': 0.3,  # Distance weight
+            'alpha2': 0.2,  # Configuration cost weight
+            'alpha3': 0.3,  # Capability similarity weight
+            'alpha4': 0.1,  # Workload weight
+            'alpha5': 0.1,  # Energy consumption weight
+            'W': np.eye(6)  # Weight matrix for configuration
+        }
+        self.beta_weights = {
+            'beta1': 0.5,  # Progress weight
+            'beta2': 0.3,  # Criticality weight
+            'beta3': 0.2   # Urgency weight
+        }
         
-    def update_status(self, status):
-        """Update task status and color for visualization"""
-        self.status = status
-        
-        # Update color based on status
-        if status == 'pending':
-            self.color = 'black'
-        elif status == 'in_progress':
-            self.color = 'green'
-        elif status == 'completed':
-            self.color = 'blue'
-        else:  # failed
-            self.color = 'red'
+        # Initialize GPU accelerator if requested
+        self.use_gpu = use_gpu
+        if use_gpu:
+            try:
+                self.gpu = GPUAccelerator()
+                self.use_gpu = self.gpu.using_gpu
+            except Exception as e:
+                print(f"Could not initialize GPU acceleration: {e}")
+                self.use_gpu = False
     
-    def get_marker(self):
-        """Get marker shape based on task status and type"""
-        if self.collaborative:
-            return '*'  # Star for collaborative tasks
-        
-        if self.status == 'pending':
-            return 's'  # Square for pending
-        elif self.status == 'in_progress':
-            return 'd'  # Diamond for in progress
-        elif self.status == 'completed':
-            return 'o'  # Circle for completed
-        else:  # failed
-            return 'x'  # X for failed
-
-
-class TaskDependencyGraph:
-    def __init__(self, tasks=None):
-        """Initialize task dependency graph
+    def run_auction(self, robots, tasks, task_graph):
+        """Run distributed auction algorithm for task allocation
         
         Args:
-            tasks: List of Task objects to initialize the graph
-        """
-        self.graph = nx.DiGraph()
-        if tasks:
-            self.update_graph(tasks)
-    
-    def update_graph(self, tasks):
-        """Update dependency graph based on task prerequisites"""
-        self.graph.clear()
-        
-        # Add all tasks as nodes
-        for task in tasks:
-            self.graph.add_node(task.id, task=task)
-        
-        # Add dependencies as edges
-        for task in tasks:
-            for prereq_id in task.prerequisites:
-                if prereq_id in self.graph:  # Ensure prerequisite exists
-                    self.graph.add_edge(prereq_id, task.id)
-    
-    def is_available(self, task_id):
-        """Check if task is available (all prerequisites completed)"""
-        if task_id not in self.graph:
-            return False
+            robots: List of Robot objects
+            tasks: List of Task objects
+            task_graph: TaskDependencyGraph object
             
-        task = self.graph.nodes[task_id]['task']
-        
-        if not task.prerequisites:
-            return True
-            
-        for prereq_id in task.prerequisites:
-            if prereq_id in self.graph:
-                prereq_task = self.graph.nodes[prereq_id]['task']
-                if prereq_task.status != 'completed':
-                    return False
-            else:
-                return False  # Prerequisite doesn't exist
-        
-        return True
-    
-    def get_critical_path(self):
-        """Identify critical path through task dependency graph
-        
         Returns:
-            List of task IDs representing the critical path
+            tuple: (assignments dict, message count)
         """
-        if not self.graph:
-            return []
+        # Find unassigned tasks that are ready (prerequisites completed)
+        unassigned_tasks = [task for task in tasks 
+                           if task.assigned_to == 0 and 
+                           task.status == 'pending' and 
+                           task_graph.is_available(task.id)]
+        
+        if not unassigned_tasks:
+            return {}, 0  # No tasks to assign
             
-        if not nx.is_directed_acyclic_graph(self.graph):
-            raise ValueError("Task graph contains cycles")
+        # Use GPU implementation if enabled and possible
+        if self.use_gpu and len(robots) > 0 and len(unassigned_tasks) > 0:
+            return self._run_auction_gpu(robots, unassigned_tasks, tasks)
+        else:
+            return self._run_auction_cpu(robots, unassigned_tasks, tasks)
+    
+    def _run_auction_gpu(self, robots, unassigned_tasks, all_tasks):
+        """GPU-accelerated auction implementation"""
+        # Prepare data for GPU processing
+        robot_positions = np.array([robot.position for robot in robots])
+        robot_capabilities = np.array([robot.capabilities for robot in robots])
+        robot_statuses = [robot.status for robot in robots]
         
-        # Use negated task completion times as weights to find longest path
-        for task_id in self.graph.nodes:
-            self.graph.nodes[task_id]['weight'] = -self.graph.nodes[task_id]['task'].completion_time
+        task_positions = np.array([task.position for task in unassigned_tasks])
+        task_capabilities = np.array([task.capabilities for task in unassigned_tasks])
         
-        # Find all terminal nodes (no outgoing edges)
-        terminal_nodes = [n for n in self.graph.nodes if self.graph.out_degree(n) == 0]
+        # Map unassigned tasks to their indices in all_tasks
+        task_id_to_idx = {task.id: i for i, task in enumerate(unassigned_tasks)}
         
-        # Find the critical path by finding the longest path to each terminal node
-        critical_path = []
-        for end_node in terminal_nodes:
-            # Find all possible start nodes (no incoming edges)
-            start_nodes = [n for n in self.graph.nodes if self.graph.in_degree(n) == 0]
+        # Current assignments and prices
+        task_assignments = np.zeros(len(unassigned_tasks), dtype=np.int32)
+        prices = np.zeros(len(unassigned_tasks), dtype=np.float32)
+        
+        # Run GPU auction
+        new_assignments, new_prices, messages = self.gpu.run_auction_gpu(
+            robot_positions, robot_capabilities, robot_statuses,
+            task_positions, task_capabilities, task_assignments,
+            self.epsilon, prices
+        )
+        
+        # Convert results back to dictionary format
+        assignments = {}
+        for i, task in enumerate(unassigned_tasks):
+            robot_idx = new_assignments[i]
+            if robot_idx > 0:  # If assigned
+                robot_id = robots[robot_idx-1].id
+                task.assigned_to = robot_id
+                assignments[task.id] = robot_id
+        
+        return assignments, messages
+    
+    def _run_auction_cpu(self, robots, unassigned_tasks, tasks):
+        """Original CPU implementation"""
+        # Track assignments and prices
+        prices = {task.id: 0.0 for task in tasks}
+        assignments = {task.id: 0 for task in tasks}
+        messages_sent = 0
+        
+        # Run auction algorithm
+        iter_count = 0
+        max_iterations = 100  # Prevent infinite loops
+        
+        while unassigned_tasks and iter_count < max_iterations:
+            iter_count += 1
             
-            for start_node in start_nodes:
-                try:
-                    path = nx.dag_longest_path(self.graph, 
-                                              weight='weight', 
-                                              source=start_node, 
-                                              target=end_node)
-                    if len(path) > len(critical_path):
-                        critical_path = path
-                except nx.NetworkXNoPath:
+            # For each robot, calculate bids for unassigned tasks
+            for robot in robots:
+                # Skip failed robots
+                if robot.status != 'operational':
                     continue
-        
-        return critical_path
-    
-    def get_task_criticality(self, task_id):
-        """Calculate task criticality (number of dependent tasks)"""
-        if task_id not in self.graph:
-            return 0
-            
-        # Get all descendants of this task
-        descendants = list(nx.descendants(self.graph, task_id))
-        return len(descendants)
-    
-    def visualize(self, ax=None):
-        """Visualize the task dependency graph"""
-        if ax is None:
-            _, ax = plt.subplots(figsize=(10, 8))
-            
-        # Position nodes using spring layout
-        pos = nx.spring_layout(self.graph)
-        
-        # Draw nodes with colors based on status
-        node_colors = []
-        for node in self.graph.nodes:
-            task = self.graph.nodes[node]['task']
-            if task.status == 'pending':
-                node_colors.append('lightgray')
-            elif task.status == 'in_progress':
-                node_colors.append('lightgreen')
-            elif task.status == 'completed':
-                node_colors.append('lightblue')
-            else:  # failed
-                node_colors.append('salmon')
                 
-        nx.draw_networkx_nodes(self.graph, pos, node_color=node_colors, 
-                              node_size=800, ax=ax)
+                # Calculate current workload
+                workload = sum(task.completion_time for task in tasks 
+                              if task.assigned_to == robot.id and
+                              task.status != 'completed')
+                robot.workload = workload
+                
+                # Find best task for this robot
+                best_utility = float('-inf')
+                best_task = None
+                best_bid = 0
+                
+                for task in unassigned_tasks:
+                    # Skip collaborative tasks for simplicity
+                    if task.collaborative:
+                        continue
+                    
+                    # Calculate bid
+                    bid = robot.calculate_bid(task, self.weights, workload)
+                    
+                    # Apply communication delay
+                    if self.communication_delay > 0:
+                        time.sleep(self.communication_delay)
+                    
+                    # Check for packet loss
+                    if random.random() < self.packet_loss_prob:
+                        continue  # Simulate packet loss
+                    
+                    messages_sent += 1
+                    
+                    # Calculate utility (bid - price)
+                    utility = bid - prices[task.id]
+                    
+                    if utility > best_utility:
+                        best_utility = utility
+                        best_task = task
+                        best_bid = bid
+                
+                # If found a task with positive utility, propose assignment
+                if best_task and best_utility > 0:
+                    # Update price
+                    prices[best_task.id] = prices[best_task.id] + self.epsilon + best_bid
+                    
+                    # Assign task to robot
+                    best_task.assigned_to = robot.id
+                    assignments[best_task.id] = robot.id
+                    
+                    # Remove from unassigned tasks
+                    unassigned_tasks.remove(best_task)
+                    
+                    messages_sent += 1  # Assignment message
         
-        # Draw edges
-        nx.draw_networkx_edges(self.graph, pos, arrows=True, 
-                              arrowstyle='->', arrowsize=20, ax=ax)
+        # Handle collaborative tasks (simplified)
+        collaborative_tasks = [task for task in tasks 
+                              if task.collaborative and task.assigned_to == 0 and
+                              task.status == 'pending']
         
-        # Draw labels
-        labels = {node: f"T{node}" for node in self.graph.nodes}
-        nx.draw_networkx_labels(self.graph, pos, labels=labels, font_size=10, ax=ax)
+        for task in collaborative_tasks:
+            # Check if at least two robots are operational
+            operational_robots = [r for r in robots if r.status == 'operational']
+            if len(operational_robots) >= 2:
+                # For simplicity, assign to the first operational robot
+                # In a real system, this would require coordination
+                task.assigned_to = operational_robots[0].id
+                assignments[task.id] = operational_robots[0].id
+                messages_sent += 1
         
-        # Highlight critical path if exists
-        try:
-            critical_path = self.get_critical_path()
-            if critical_path:
-                critical_edges = [(critical_path[i], critical_path[i+1]) 
-                                for i in range(len(critical_path)-1)]
-                nx.draw_networkx_edges(self.graph, pos, edgelist=critical_edges,
-                                      edge_color='red', width=3, arrows=True,
-                                      arrowstyle='->', arrowsize=20, ax=ax)
-        except:
-            pass  # Ignore errors in critical path calculation
+        return assignments, messages_sent
+    
+    def run_recovery_auction(self, operational_robots, failed_tasks, task_graph):
+        """Special auction for task reallocation after failure
+        
+        Args:
+            operational_robots: List of operational Robot objects
+            failed_tasks: List of Task objects that need reallocation
+            task_graph: TaskDependencyGraph object
             
-        ax.set_title("Task Dependency Graph")
-        ax.set_axis_off()
+        Returns:
+            tuple: (assignments dict, message count)
+        """
+        assignments = {}
+        messages_sent = 0
         
-        return ax
+        # Use GPU acceleration for recovery when possible
+        if self.use_gpu and len(operational_robots) > 0 and len(failed_tasks) > 0:
+            # Prepare data structures for GPU processing
+            robot_positions = np.array([robot.position for robot in operational_robots])
+            robot_capabilities = np.array([robot.capabilities for robot in operational_robots])
+            robot_statuses = ['operational'] * len(operational_robots)
+            
+            task_positions = np.array([task.position for task in failed_tasks])
+            task_capabilities = np.array([task.capabilities for task in failed_tasks])
+            
+            # Current assignments and prices
+            task_assignments = np.zeros(len(failed_tasks), dtype=np.int32)
+            prices = np.zeros(len(failed_tasks), dtype=np.float32)
+            
+            # Run GPU auction with parameters adjusted for recovery
+            new_assignments, _, messages = self.gpu.run_auction_gpu(
+                robot_positions, robot_capabilities, robot_statuses,
+                task_positions, task_capabilities, task_assignments,
+                self.epsilon * 2,  # Higher epsilon for faster convergence in recovery
+                prices
+            )
+            
+            # Process results
+            for i, task in enumerate(failed_tasks):
+                robot_idx = new_assignments[i]
+                if robot_idx > 0:  # If assigned
+                    robot_id = operational_robots[robot_idx-1].id
+                    task.assigned_to = robot_id
+                    assignments[task.id] = robot_id
+            
+            return assignments, messages
+        
+        # Fall back to CPU implementation
+        for task in failed_tasks:
+            best_bid = float('-inf')
+            best_robot = None
+            
+            for robot in operational_robots:
+                # Calculate standard bid
+                standard_bid = robot.calculate_bid(task, self.weights, robot.workload)
+                
+                # Calculate task criticality (number of dependent tasks)
+                criticality = task_graph.get_task_criticality(task.id)
+                
+                # Calculate urgency
+                urgency = task.progress if task.status == 'in_progress' else 0
+                
+                # Calculate recovery bid
+                recovery_bid = robot.calculate_recovery_bid(standard_bid, task.progress, 
+                                                          criticality, urgency, 
+                                                          self.beta_weights)
+                
+                # Apply communication delay and check for packet loss
+                if self.communication_delay > 0:
+                    time.sleep(self.communication_delay)
+                
+                if random.random() < self.packet_loss_prob:
+                    continue  # Simulate packet loss
+                
+                messages_sent += 1
+                
+                if recovery_bid > best_bid:
+                    best_bid = recovery_bid
+                    best_robot = robot
+            
+            if best_robot:
+                task.assigned_to = best_robot.id
+                assignments[task.id] = best_robot.id
+                messages_sent += 1
+        
+        return assignments, messages_sent

@@ -1,28 +1,11 @@
-# decentralized_control/main.py
-
+# main.py
 import os
 import sys
 import argparse
 import yaml
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from PyQt5.QtWidgets import QApplication
-
-from core.simulator import Simulator
-from core.experiment_runner import ExperimentRunner
-from core.analysis import analyze_results, generate_reports
-from gui.visualization import VisualizationApp
-
-def load_config(config_path):
-    """Load configuration from YAML file"""
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Configuration file not found: {config_path}")
-    
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    
-    return config
+import random
+import torch
 
 def main():
     parser = argparse.ArgumentParser(description='Decentralized Control System for Dual Mobile Manipulators')
@@ -34,32 +17,56 @@ def main():
                        help='Results file path for analysis mode')
     parser.add_argument('--processes', type=int, default=None,
                        help='Number of processes for parallel experiment execution')
+    parser.add_argument('--use-gpu', action='store_true',
+                       help='Enable GPU acceleration')
+    parser.add_argument('--visualize', action='store_true',
+                       help='Enable visualization during simulations (slower)')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed for reproducibility')
     args = parser.parse_args()
+    
+    # Set random seeds for reproducibility
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
     
     # Ensure results directory exists
     os.makedirs(os.path.dirname(args.results), exist_ok=True)
     
     if args.mode == 'gui':
         # Run interactive GUI
+        from PyQt5.QtWidgets import QApplication
+        from gui.visualization import VisualizationApp
+        
         app = QApplication(sys.argv)
         config = load_config(args.config)
+        config['use_gpu'] = args.use_gpu
+        
         window = VisualizationApp(config)
         window.show()
         sys.exit(app.exec_())
     
     elif args.mode == 'experiment':
         # Run factorial experiment
+        from core.experiment_runner import ExperimentRunner
+        
         config = load_config(args.config)
+        config['use_gpu'] = args.use_gpu
+        config['visualize'] = args.visualize
+        
         runner = ExperimentRunner(config)
         results = runner.run_factorial_experiment(num_processes=args.processes)
         runner.save_results(results, args.results)
         
         # Generate basic analysis automatically
+        from core.analysis import analyze_results, generate_reports
         analyze_results(args.results)
         generate_reports(args.results)
     
     elif args.mode == 'analysis':
         # Run analysis on existing results
+        from core.analysis import analyze_results, generate_reports
+        
         if not os.path.exists(args.results):
             print(f"Error: Results file not found: {args.results}")
             return
@@ -69,6 +76,16 @@ def main():
         
         # Return results to allow further analysis in interactive mode
         return analysis_results
+
+def load_config(config_path):
+    """Load configuration from YAML file"""
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Configuration file not found: {config_path}")
+    
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    return config
 
 if __name__ == '__main__':
     main()

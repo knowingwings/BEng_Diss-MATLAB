@@ -1,5 +1,4 @@
-# decentralized_control/core/robot.py
-
+# core/robot.py
 import numpy as np
 
 class Robot:
@@ -43,12 +42,14 @@ class Robot:
         
         b_ij = (α₁/d_ij) + (α₂/c_ij) + α₃·s_ij - α₄·l_i - α₅·e_ij
         
-        where:
-        - d_ij: Euclidean distance to task
-        - c_ij: Configuration transition cost
-        - s_ij: Capability similarity
-        - l_i: Current workload
-        - e_ij: Estimated energy consumption
+        Args:
+            task: Task object to calculate bid for
+            weights: Dictionary of weight parameters
+            current_workload: Current workload value
+            energy_consumption: Estimated energy consumption (optional)
+            
+        Returns:
+            float: Bid value
         """
         # Extract weights
         alpha1 = weights['alpha1']
@@ -59,7 +60,10 @@ class Robot:
         W = weights['W']
         
         # Calculate distance to task
-        distance = np.linalg.norm(self.position - task.position)
+        # Use faster Euclidean distance calculation for 2D points
+        dx = self.position[0] - task.position[0]
+        dy = self.position[1] - task.position[1]
+        distance = (dx*dx + dy*dy)**0.5
         
         # Calculate configuration transition cost
         config_diff = self.config - task.required_config
@@ -70,6 +74,7 @@ class Robot:
         task_cap_norm = np.linalg.norm(task.capabilities)
         
         if robot_cap_norm > 0 and task_cap_norm > 0:
+            # Use dot product for faster calculation
             capability_similarity = np.dot(self.capabilities, task.capabilities) / (robot_cap_norm * task_cap_norm)
         else:
             capability_similarity = 0
@@ -86,11 +91,15 @@ class Robot:
         
         b^r_ij = b_ij + β₁(1 - p_j) + β₂·criticality(j) + β₃·urgency(j)
         
-        where:
-        - b_ij: Standard bid
-        - p_j: Task progress
-        - criticality(j): Number of dependent tasks
-        - urgency(j): Time urgency factor
+        Args:
+            standard_bid: Standard bid value
+            task_progress: Current progress on the task (0-1)
+            task_criticality: Criticality measure of the task
+            task_urgency: Urgency measure of the task
+            beta_weights: Dictionary of beta weight parameters
+            
+        Returns:
+            float: Recovery bid value
         """
         beta1 = beta_weights['beta1']
         beta2 = beta_weights['beta2']
