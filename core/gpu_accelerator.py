@@ -6,12 +6,23 @@ class GPUAccelerator:
     """GPU acceleration for compute-intensive operations"""
     
     def __init__(self):
-        # Check if GPU is available
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.using_gpu = self.device.type == 'cuda'
-        
-        # Pre-allocate tensors for common operations
-        self.eye6 = torch.eye(6, device=self.device)
+        def __init__(self):
+            # Check if GPU is available - modified to check for AMD GPUs too
+            if hasattr(torch, 'hip') and torch.hip.is_available():
+                self.device = torch.device('hip')
+                self.using_gpu = True
+                print(f"AMD GPU acceleration enabled: {torch.hip.get_device_name(0)}")
+            elif torch.cuda.is_available():
+                self.device = torch.device('cuda')
+                self.using_gpu = True
+                print(f"NVIDIA GPU acceleration enabled: {torch.cuda.get_device_name(0)}")
+            else:
+                self.device = torch.device('cpu')
+                self.using_gpu = False
+                print("GPU not available, using CPU")
+            
+            # Pre-allocate tensors for common operations
+            self.eye6 = torch.eye(6, device=self.device)
         
         if self.using_gpu:
             print(f"GPU acceleration enabled: {torch.cuda.get_device_name(0)}")
