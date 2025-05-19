@@ -2,15 +2,21 @@
 import torch
 import numpy as np
 import os
+import time
+import random
 
 class GPUAccelerator:
     """GPU acceleration with support for AMD GPU detected through CUDA compatibility"""
     
-    def __init__(self):
+    def __init__(self, communication_delay=0, packet_loss_prob=0):
         """Initialize GPU accelerator for the unique configuration detected"""
         self.using_gpu = False
         self.device = torch.device('cpu')
         self.is_amd_via_cuda = False
+        
+        # Communication parameters (added)
+        self.communication_delay = communication_delay
+        self.packet_loss_prob = packet_loss_prob
         
         try:
             if torch.cuda.is_available():
@@ -59,6 +65,11 @@ class GPUAccelerator:
                 self.device = torch.device('cpu')
                 self.using_gpu = False
                 print("Falling back to CPU")
+    
+    def set_communication_params(self, communication_delay, packet_loss_prob):
+        """Update communication parameters"""
+        self.communication_delay = communication_delay
+        self.packet_loss_prob = packet_loss_prob
     
     def to_tensor(self, array):
         """Convert numpy array to tensor on correct device"""
@@ -203,6 +214,15 @@ class GPUAccelerator:
         Returns:
             tuple: (new_assignments, new_prices, message_count)
         """
+        # Apply communication delay (added)
+        if self.communication_delay > 0:
+            time.sleep(self.communication_delay)
+        
+        # Apply packet loss simulation (added)
+        if random.random() < self.packet_loss_prob:
+            # Return unchanged assignments with no messages to simulate packet loss
+            return task_assignments, prices, 0
+            
         # Default weights (can be passed as parameter)
         weights = {
             'alpha1': 0.3,
@@ -261,6 +281,14 @@ class GPUAccelerator:
             
             # For each operational robot
             for r_idx in op_robots:
+                # Apply communication delay again for each robot's bidding process
+                if self.communication_delay > 0:
+                    time.sleep(self.communication_delay * 0.1)  # Scale down for per-robot delay
+                
+                # Check for packet loss per robot's bidding
+                if random.random() < self.packet_loss_prob:
+                    continue  # Skip this robot's bidding due to packet loss
+                    
                 # Calculate bids for all unassigned tasks
                 task_indices = unassigned.cpu().numpy()
                 

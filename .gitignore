@@ -2,4 +2,4 @@
 __pycache__/
 *.whl
 *.py[cod]
-results/
+results/*

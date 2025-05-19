@@ -37,7 +37,7 @@ class DistributedAuction:
         self.use_gpu = use_gpu
         if use_gpu:
             try:
-                self.gpu = GPUAccelerator()
+                self.gpu = GPUAccelerator(communication_delay, packet_loss_prob)
                 self.use_gpu = self.gpu.using_gpu
             except Exception as e:
                 print(f"Could not initialize GPU acceleration: {e}")
@@ -54,6 +54,9 @@ class DistributedAuction:
         Returns:
             tuple: (assignments dict, message count)
         """
+        # Print debug information about parameters
+        print(f"Running auction with epsilon={self.epsilon}, delay={self.communication_delay*1000}ms, packet_loss={self.packet_loss_prob}")
+        
         # Find unassigned tasks that are ready (prerequisites completed)
         unassigned_tasks = [task for task in tasks 
                            if task.assigned_to == 0 and 
@@ -65,6 +68,8 @@ class DistributedAuction:
             
         # Use GPU implementation if enabled and possible
         if self.use_gpu and len(robots) > 0 and len(unassigned_tasks) > 0:
+            # Update GPU accelerator communication parameters
+            self.gpu.set_communication_params(self.communication_delay, self.packet_loss_prob)
             return self._run_auction_gpu(robots, unassigned_tasks, tasks)
         else:
             return self._run_auction_cpu(robots, unassigned_tasks, tasks)
@@ -172,6 +177,14 @@ class DistributedAuction:
                 
                 # If found a task with positive utility, propose assignment
                 if best_task and best_utility > 0:
+                    # Apply communication delay for assignment message
+                    if self.communication_delay > 0:
+                        time.sleep(self.communication_delay)
+                    
+                    # Check for packet loss for assignment message  
+                    if random.random() < self.packet_loss_prob:
+                        continue  # Packet loss on assignment message
+                        
                     # Update price - critical for maintaining 2ε optimality gap
                     prices[best_task.id] = prices[best_task.id] + self.epsilon + best_utility
                     
@@ -221,6 +234,9 @@ class DistributedAuction:
         Returns:
             tuple: (assignments dict, message count)
         """
+        # Print debug info
+        print(f"Running recovery auction for {len(failed_tasks)} tasks with {len(operational_robots)} robots")
+        
         assignments = {}
         messages_sent = 0
         
@@ -237,6 +253,9 @@ class DistributedAuction:
             # Current assignments and prices
             task_assignments = np.zeros(len(failed_tasks), dtype=np.int32)
             prices = np.zeros(len(failed_tasks), dtype=np.float32)
+            
+            # Update GPU accelerator communication parameters
+            self.gpu.set_communication_params(self.communication_delay, self.packet_loss_prob)
             
             # Run GPU auction with parameters adjusted for recovery
             new_assignments, _, messages = self.gpu.run_auction_gpu(
@@ -262,6 +281,14 @@ class DistributedAuction:
             best_robot = None
             
             for robot in operational_robots:
+                # Apply communication delay for bid calculation
+                if self.communication_delay > 0:
+                    time.sleep(self.communication_delay)
+                
+                # Check for packet loss
+                if random.random() < self.packet_loss_prob:
+                    continue  # Simulate packet loss
+                    
                 # Calculate standard bid
                 standard_bid = robot.calculate_bid(task, self.weights, robot.workload)
                 
@@ -276,13 +303,6 @@ class DistributedAuction:
                                                           criticality, urgency, 
                                                           self.beta_weights)
                 
-                # Apply communication delay and check for packet loss
-                if self.communication_delay > 0:
-                    time.sleep(self.communication_delay)
-                
-                if random.random() < self.packet_loss_prob:
-                    continue  # Simulate packet loss
-                
                 messages_sent += 1
                 
                 if recovery_bid > best_bid:
@@ -290,6 +310,14 @@ class DistributedAuction:
                     best_robot = robot
             
             if best_robot:
+                # Apply communication delay for assignment
+                if self.communication_delay > 0:
+                    time.sleep(self.communication_delay)
+                
+                # Check for packet loss on assignment
+                if random.random() < self.packet_loss_prob:
+                    continue  # Packet loss on assignment message
+                    
                 task.assigned_to = best_robot.id
                 assignments[task.id] = best_robot.id
                 messages_sent += 1

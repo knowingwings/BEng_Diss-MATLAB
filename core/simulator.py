@@ -146,6 +146,7 @@ class Simulator:
         Returns:
             float: Recovery time
         """
+        # Record start time for recovery
         start_time = self.sim_time
         
         # Get operational robots
@@ -179,9 +180,21 @@ class Simulator:
         Returns:
             dict: Simulation metrics
         """
+        # Reset simulation state and metrics
         self.sim_time = 0.0
         step_count = 0
-        self.metrics['message_count'] = 0
+        
+        # Properly reset metrics for this run
+        self.metrics = {
+            'message_count': 0,
+            'makespan': 0,
+            'recovery_time': 0,
+            'completion_rate': 0,
+            'workload_balance': 0,
+            'optimality_gap': 0,
+            'execution_times': [],
+            'bid_history': []
+        }
         
         # Reset trajectories if visualizing
         if visualize:
@@ -234,7 +247,14 @@ class Simulator:
             # Update task progress - vectorized operations where possible
             for i, task in enumerate(self.tasks):
                 if task.status == 'in_progress':
-                    task.progress += self.dt / task.completion_time
+                    # Apply communication delay effect on task execution (scaled based on delay)
+                    delay_factor = 1.0
+                    if self.comm_delay > 0:
+                        delay_factor = 1.0 + (self.comm_delay / 1000.0 * 0.1)  # Scale factor based on delay
+                    
+                    # Progress speed inversely affected by delay factor
+                    progress_rate = self.dt / (task.completion_time * delay_factor)
+                    task.progress += progress_rate
                     
                     # Check if task completed
                     if task.progress >= 1.0:
@@ -277,7 +297,7 @@ class Simulator:
                             if visualize:
                                 self.log_event(f"Robot {robot.id} started Task {target_task.id} at t={self.sim_time:.1f}s")
             else:
-                # Fast path for simulation-only mode
+                # Fast path for simulation-only mode - BUT now with communication effects
                 # Directly assign tasks without moving robots
                 for robot in self.robots:
                     if robot.status != 'operational':
@@ -287,27 +307,48 @@ class Simulator:
                     assigned_mask = (task_assignments == robot.id) & (task_statuses == 0)
                     
                     if np.any(assigned_mask):
-                        # Get indices of assigned pending tasks
-                        task_indices_to_start = np.where(assigned_mask)[0]
+                        # Simulate communication delay before task execution
+                        if self.comm_delay > 0:
+                            # Scale time proportionally to delay (but don't actually sleep)
+                            # This changes when tasks start executing
+                            comm_delay_time = self.comm_delay / 1000.0  # convert ms to seconds
+                            self.sim_time += comm_delay_time * 0.2  # 20% of the delay affects start time
                         
-                        # Start executing all assigned tasks immediately
-                        for idx in task_indices_to_start:
-                            self.tasks[idx].update_status('in_progress')
-                            self.tasks[idx].start_time = self.sim_time
-                            task_statuses[idx] = status_codes['in_progress']
+                        # Simulate packet loss - some tasks might not receive start signal
+                        if self.packet_loss > 0:
+                            # For each task, check if it got the start signal
+                            task_indices_to_start = np.where(assigned_mask)[0]
+                            for idx in task_indices_to_start:
+                                if random.random() < self.packet_loss:
+                                    continue  # Skip this task due to packet loss
+                                    
+                                self.tasks[idx].update_status('in_progress')
+                                self.tasks[idx].start_time = self.sim_time
+                                task_statuses[idx] = status_codes['in_progress']
+                        else:
+                            # No packet loss, start all tasks
+                            task_indices_to_start = np.where(assigned_mask)[0]
+                            for idx in task_indices_to_start:
+                                self.tasks[idx].update_status('in_progress')
+                                self.tasks[idx].start_time = self.sim_time
+                                task_statuses[idx] = status_codes['in_progress']
             
             # Inject robot failure if configured
             if inject_failure and self.sim_time >= max_time*failure_time_fraction and not failure_time:
-                if random.random() < 0.5:  # 50% chance of failure
-                    # Randomly select a robot to fail
-                    _, failed_tasks = self.inject_robot_failure(failure_type=random.choice(['complete', 'partial']))
-                    failure_time = self.sim_time
+                # Force failure for testing purposes rather than 50% probability
+                _, failed_tasks = self.inject_robot_failure(
+                    robot_id=None,  # Random selection
+                    failure_type=random.choice(['complete', 'partial'])
+                )
+                failure_time = self.sim_time
+                self.log_event(f"Injected failure at t={failure_time:.2f}s, {len(failed_tasks)} tasks affected")
             
             # Run recovery if tasks need reassignment
             if failed_tasks and not recovery_complete_time:
-                self.run_recovery(failed_tasks)
+                recovery_time = self.run_recovery(failed_tasks)
                 failed_tasks = []
                 recovery_complete_time = self.sim_time
+                self.log_event(f"Recovery completed at t={recovery_complete_time:.2f}s, took {recovery_time:.2f}s")
             
             # Update simulation time
             self.sim_time += self.dt
