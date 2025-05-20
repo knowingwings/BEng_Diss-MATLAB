@@ -42,6 +42,9 @@ class DistributedAuction:
             except Exception as e:
                 print(f"Could not initialize GPU acceleration: {e}")
                 self.use_gpu = False
+                
+        # Add this line to maintain task prices between auctions
+        self.task_prices = {}  # Dictionary to store task prices
     
     def run_auction(self, robots, tasks, task_graph):
         """Run distributed auction algorithm for task allocation
@@ -59,21 +62,41 @@ class DistributedAuction:
         
         # Find unassigned tasks that are ready (prerequisites completed)
         unassigned_tasks = [task for task in tasks 
-                           if task.assigned_to == 0 and 
-                           task.status == 'pending' and 
-                           task_graph.is_available(task.id)]
+                        if task.assigned_to == 0 and 
+                        task.status == 'pending' and 
+                        task_graph.is_available(task.id)]
         
         if not unassigned_tasks:
             return {}, 0  # No tasks to assign
+        
+        # Initialize prices for new tasks
+        for task in unassigned_tasks:
+            if task.id not in self.task_prices:
+                self.task_prices[task.id] = 0.0
+        
+        # Get current prices for tasks in this auction
+        prices = {task.id: self.task_prices.get(task.id, 0.0) for task in tasks}
             
         # Use GPU implementation if enabled and possible
         if self.use_gpu and len(robots) > 0 and len(unassigned_tasks) > 0:
             # Update GPU accelerator communication parameters
             self.gpu.set_communication_params(self.communication_delay, self.packet_loss_prob)
-            return self._run_auction_gpu(robots, unassigned_tasks, tasks)
+            assignments, new_prices, messages = self._run_auction_gpu(robots, unassigned_tasks, tasks)
+            
+            # Update stored prices
+            for task_id, price in new_prices.items():
+                self.task_prices[task_id] = price
+            
+            return assignments, messages
         else:
-            return self._run_auction_cpu(robots, unassigned_tasks, tasks)
-    
+            assignments, messages = self._run_auction_cpu(robots, unassigned_tasks, tasks)
+            
+            # Update stored prices from CPU auction
+            for task_id, price in prices.items():
+                self.task_prices[task_id] = price
+            
+            return assignments, messages
+        
     def _run_auction_gpu(self, robots, unassigned_tasks, all_tasks):
         """GPU-accelerated auction implementation"""
         # Debug logging to track epsilon's effect
@@ -90,9 +113,11 @@ class DistributedAuction:
         # Map unassigned tasks to their indices in all_tasks
         task_id_to_idx = {task.id: i for i, task in enumerate(unassigned_tasks)}
         
+        # Retrieve current prices for tasks in this auction
+        current_prices = np.array([self.task_prices.get(task.id, 0.0) for task in unassigned_tasks], dtype=np.float32)
+        
         # Current assignments and prices
         task_assignments = np.zeros(len(unassigned_tasks), dtype=np.int32)
-        prices = np.zeros(len(unassigned_tasks), dtype=np.float32)
         
         # Create weights dictionary with epsilon explicitly included
         weights = self.weights.copy()
@@ -102,21 +127,26 @@ class DistributedAuction:
         new_assignments, new_prices, messages = self.gpu.run_auction_gpu(
             robot_positions, robot_capabilities, robot_statuses,
             task_positions, task_capabilities, task_assignments,
-            self.epsilon, prices,
+            self.epsilon, current_prices,  # Use current prices instead of zeros
             weights=weights  # Pass weights including epsilon
         )
         
         # Convert results back to dictionary format
         assignments = {}
+        price_updates = {}
+        
         for i, task in enumerate(unassigned_tasks):
             robot_idx = new_assignments[i]
             if robot_idx > 0:  # If assigned
                 robot_id = robots[robot_idx-1].id
                 task.assigned_to = robot_id
                 assignments[task.id] = robot_id
+            
+            # Update task prices in the class dictionary
+            price_updates[task.id] = new_prices[i]
         
-        return assignments, messages
-    
+        return assignments, price_updates, messages
+        
     def _run_auction_cpu(self, robots, unassigned_tasks, tasks):
         """Original CPU implementation"""
         # Track assignments and prices
