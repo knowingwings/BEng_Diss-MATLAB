@@ -1,9 +1,11 @@
-# decentralized_control/config/default.yaml
+# config/default.yaml
 parameters:
   num_tasks: 8
   comm_delay: 0
   packet_loss: 0.0
   epsilon: 0.01
+  termination_mode: "assignment-complete"  # Default mode
+  price_stability_threshold: 0.01
 
 experiment:
   num_runs: 1

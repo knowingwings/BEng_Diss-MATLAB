@@ -49,28 +49,39 @@ class DistributedAuction:
         self.centralized_solver = None
         self.centralized_solution = None
     
-    def run_auction(self, robots, tasks, task_graph):
+    def run_auction(self, robots, tasks, task_graph, termination_mode="assignment-complete", price_stability_threshold=0.01):
         """Run distributed auction algorithm for task allocation
         
         Args:
             robots: List of Robot objects
             tasks: List of Task objects
             task_graph: TaskDependencyGraph object
+            termination_mode: "assignment-complete" or "price-stabilized"
+            price_stability_threshold: Threshold for price stability detection
             
         Returns:
             tuple: (assignments dict, message count)
         """
+        # Ensure price_stability_threshold is a scalar, not a list/array
+        if isinstance(price_stability_threshold, (list, tuple, np.ndarray)):
+            price_stability_threshold = float(price_stability_threshold[0])
+        else:
+            price_stability_threshold = float(price_stability_threshold)
+            
         # Start a new run with configuration
         if hasattr(self, 'data_collector'):
             self.data_collector.start_run({
                 'epsilon': self.epsilon,
                 'num_tasks': len(tasks),
                 'comm_delay': self.communication_delay * 1000.0,  # Convert to ms
-                'packet_loss': self.packet_loss_prob
+                'packet_loss': self.packet_loss_prob,
+                'termination_mode': termination_mode,
+                'price_stability_threshold': price_stability_threshold
             })
         
         # Print debug information about parameters
-        print(f"Running auction with epsilon={self.epsilon}, delay={self.communication_delay*1000}ms, packet_loss={self.packet_loss_prob}")
+        print(f"Running auction with epsilon={self.epsilon}, delay={self.communication_delay*1000}ms, " 
+            f"packet_loss={self.packet_loss_prob}, termination_mode={termination_mode}")
         
         # Run centralized solver for comparison if available
         if hasattr(self, 'data_collector') and self.centralized_solver is None:
@@ -103,9 +114,11 @@ class DistributedAuction:
         if self.use_gpu and len(robots) > 0 and len(unassigned_tasks) > 0:
             # Update GPU accelerator communication parameters
             self.gpu.set_communication_params(self.communication_delay, self.packet_loss_prob)
-            assignments, messages = self._run_auction_gpu(robots, unassigned_tasks, tasks)
+            assignments, messages = self._run_auction_gpu(robots, unassigned_tasks, tasks, 
+                                                    termination_mode, price_stability_threshold)
         else:
-            assignments, messages = self._run_auction_cpu(robots, unassigned_tasks, tasks)
+            assignments, messages = self._run_auction_cpu(robots, unassigned_tasks, tasks, 
+                                                    termination_mode, price_stability_threshold)
         
         # Calculate optimality gap if centralized solution is available
         optimality_gap = None
@@ -130,7 +143,8 @@ class DistributedAuction:
             completion_data = {
                 'phase': 'auction_complete',
                 'assignments': len(assignments),
-                'messages': messages
+                'messages': messages,
+                'termination_mode': termination_mode
             }
             
             if optimality_gap is not None:
@@ -149,10 +163,11 @@ class DistributedAuction:
         
         return assignments, messages
     
-    def _run_auction_gpu(self, robots, unassigned_tasks, all_tasks):
-        """GPU-accelerated auction implementation with enhanced data collection"""
+    def _run_auction_gpu(self, robots, unassigned_tasks, all_tasks, termination_mode="assignment-complete", 
+                   price_stability_threshold=0.01):
+        """GPU-accelerated auction implementation with enhanced termination conditions"""
         # Debug logging to track epsilon's effect
-        print(f"DEBUG: Using epsilon={self.epsilon} in GPU auction")
+        print(f"DEBUG: Using epsilon={self.epsilon} in GPU auction with termination_mode={termination_mode}")
         
         # Prepare data for GPU processing
         robot_positions = np.array([robot.position for robot in robots])
@@ -178,21 +193,24 @@ class DistributedAuction:
                 'phase': 'gpu_auction_start',
                 'num_tasks': len(unassigned_tasks),
                 'epsilon': self.epsilon,
-                'prices': price_dict.copy()
+                'prices': price_dict.copy(),
+                'termination_mode': termination_mode
             })
         
         # Create weights dictionary with epsilon explicitly included
         weights = self.weights.copy()
         weights['epsilon'] = self.epsilon  # Critical: ensure epsilon is passed to GPU
         
-        # Run GPU auction
+        # Run GPU auction with specified termination mode
         new_assignments, new_prices, messages = self.gpu.run_auction_gpu(
             robot_positions, robot_capabilities, robot_statuses,
             task_positions, task_capabilities, task_assignments,
             self.epsilon, prices,
             weights=weights,  # Pass weights including epsilon
             data_collector=self.data_collector if hasattr(self, 'data_collector') else None,
-            unassigned_task_ids=[task.id for task in unassigned_tasks]
+            unassigned_task_ids=[task.id for task in unassigned_tasks],
+            termination_mode=termination_mode,
+            price_stability_threshold=price_stability_threshold
         )
         
         # Convert results back to dictionary format
@@ -218,7 +236,8 @@ class DistributedAuction:
                 'phase': 'gpu_auction_complete',
                 'final_prices': final_prices,
                 'final_assignments': final_assignments,
-                'total_messages': messages
+                'total_messages': messages,
+                'termination_mode': termination_mode
             })
         
         # Process task assignments
@@ -231,16 +250,39 @@ class DistributedAuction:
                 
                 # Record assignment for data collection
                 if hasattr(self, 'data_collector'):
-                    self.data_collector.record_assignment(task.id, robot_id, 1)  # GPU uses a single "iteration"
+                    self.data_collector.record_iteration_status = 1  # GPU uses a single "iteration"
         
         return assignments, messages
     
-    def _run_auction_cpu(self, robots, unassigned_tasks, tasks):
-        """Original CPU implementation with enhanced data collection"""
+    def _run_auction_cpu(self, robots, unassigned_tasks, tasks, termination_mode="assignment-complete", price_stability_threshold=0.01):
+        """Original CPU implementation with enhanced termination conditions
+        
+        Args:
+            robots: List of Robot objects
+            unassigned_tasks: List of unassigned Task objects
+            tasks: Complete list of Task objects
+            termination_mode: "assignment-complete" or "price-stabilized"
+            price_stability_threshold: Threshold for price stability detection
+            
+        Returns:
+            tuple: (assignments dict, message count)
+        """
+        
+        #Ensure price_stability_threshold is a scalar, not a list/array
+        if isinstance(price_stability_threshold, (list, tuple, np.ndarray)):
+            price_stability_threshold = float(price_stability_threshold[0])
+        else:
+            price_stability_threshold = float(price_stability_threshold)
+        
         # Track assignments and prices
         prices = {task.id: 0.0 for task in tasks}
         assignments = {task.id: 0 for task in tasks}
         messages_sent = 0
+        
+        # For price stability detection
+        price_changes_history = []
+        max_stable_count = 3  # Number of iterations with stable prices to confirm convergence
+        stable_count = 0
         
         # Set max_iterations based on theoretical bound: K² · bₘₐₓ/ε 
         # where K is task count and bₘₐₓ is maximum possible bid value
@@ -258,15 +300,20 @@ class DistributedAuction:
                 'num_tasks': len(unassigned_tasks),
                 'max_iterations': max_iterations,
                 'epsilon': self.epsilon,
-                'theoretical_max_iter': theoretical_max_iter
+                'theoretical_max_iter': theoretical_max_iter,
+                'termination_mode': termination_mode,
+                'price_stability_threshold': price_stability_threshold
             })
         
         # Run auction algorithm
         iter_count = 0
         
-        while unassigned_tasks and iter_count < max_iterations:
+        while iter_count < max_iterations:
             iter_count += 1
             tasks_assigned_this_iter = 0
+            
+            # Start iteration with fresh price change tracker
+            price_changes = []
             
             # Create a snapshot of prices at the start of this iteration
             # for data collection and correct utility calculations
@@ -345,6 +392,9 @@ class DistributedAuction:
                     price_increase = self.epsilon + best_utility
                     new_price = old_price + price_increase
                     
+                    # Track price change for stability detection
+                    price_changes.append(abs(new_price - old_price))
+                    
                     # Debug logging for price update
                     print(f"DEBUG: Task {best_task.id} - Old price: {old_price:.4f}, "
                         f"Increase: {price_increase:.4f} (epsilon={self.epsilon:.4f}, "
@@ -373,6 +423,10 @@ class DistributedAuction:
                     messages_sent += 1  # Assignment message
                     tasks_assigned_this_iter += 1
             
+            # Track price changes for stability detection
+            avg_price_change = sum(price_changes) / len(price_changes) if price_changes else 0
+            price_changes_history.append(avg_price_change)
+            
             # Record iteration end with data collector
             if hasattr(self, 'data_collector'):
                 self.data_collector.record_iteration(iter_count, {
@@ -380,13 +434,34 @@ class DistributedAuction:
                     'tasks_assigned': tasks_assigned_this_iter,
                     'unassigned_remaining': len(unassigned_tasks),
                     'messages_this_iter': messages_sent,
-                    'current_prices': prices.copy()
+                    'current_prices': prices.copy(),
+                    'avg_price_change': avg_price_change
                 })
             
-            # If no tasks were assigned in this iteration, break to ensure convergence
-            if tasks_assigned_this_iter == 0:
-                break
-        
+            # Check termination conditions based on mode
+            if termination_mode == "assignment-complete":
+                # Original termination logic
+                if not unassigned_tasks:
+                    # All tasks assigned
+                    break
+                if tasks_assigned_this_iter == 0:
+                    # No progress in this iteration
+                    break
+                    
+            elif termination_mode == "price-stabilized":
+                # Check price stability
+                if avg_price_change < price_stability_threshold:
+                    stable_count += 1
+                    if stable_count >= max_stable_count:
+                        # Prices have stabilized for several consecutive iterations
+                        break
+                else:
+                    stable_count = 0
+                    
+                # Also break if all tasks assigned (common sense)
+                if not unassigned_tasks:
+                    break
+                    
         # Log if we hit the iteration limit (useful for debugging)
         if iter_count >= max_iterations and unassigned_tasks:
             print(f"Warning: CPU Auction reached maximum iterations ({max_iterations}) with {len(unassigned_tasks)} tasks still unassigned.")
@@ -399,7 +474,11 @@ class DistributedAuction:
                 'unassigned_remaining': len(unassigned_tasks),
                 'total_messages': messages_sent,
                 'final_prices': prices.copy(),
-                'final_assignments': assignments.copy()
+                'final_assignments': assignments.copy(),
+                'termination_reason': ('max_iterations' if iter_count >= max_iterations else
+                                    ('all_assigned' if not unassigned_tasks else
+                                    ('no_progress' if tasks_assigned_this_iter == 0 else
+                                    'price_stabilized')))
             })
         
         # Handle collaborative tasks (simplified)

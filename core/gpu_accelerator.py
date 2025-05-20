@@ -34,7 +34,7 @@ class GPUAccelerator:
                 # Set specific settings for AMD GPUs detected through CUDA
                 if self.is_amd_via_cuda:
                     # Limit memory usage to avoid crashes
-                    torch.cuda.set_per_process_memory_fraction(0.7)
+                    torch.cuda.set_per_process_memory_fraction(0.8)
             else:
                 print("No GPU detected, using CPU")
                 # Optimize CPU settings
@@ -140,9 +140,10 @@ class GPUAccelerator:
         return bids
             
     def run_auction_gpu(self, robot_positions, robot_capabilities, robot_statuses, 
-                   task_positions, task_capabilities, task_assignments, 
-                   epsilon, prices, weights=None, data_collector=None,
-                   unassigned_task_ids=None):
+               task_positions, task_capabilities, task_assignments, 
+               epsilon, prices, weights=None, data_collector=None,
+               unassigned_task_ids=None, termination_mode="assignment-complete",
+               price_stability_threshold=0.01):
         """Run distributed auction algorithm on GPU
         
         Args:
@@ -157,6 +158,8 @@ class GPUAccelerator:
             weights: Dictionary of weights for bid calculation
             data_collector: Optional data collector for metrics
             unassigned_task_ids: Optional list of original task IDs for data collection
+            termination_mode: "assignment-complete" or "price-stabilized"
+            price_stability_threshold: Threshold for price stability detection
             
         Returns:
             tuple: (new_assignments, new_prices, message_count)
@@ -217,6 +220,17 @@ class GPUAccelerator:
         # Set a practical upper limit to prevent excessive iterations
         max_iterations = min(theoretical_max_iter, 1000)
         
+        # Ensure price_stability_threshold is a scalar, not a list/array
+        if isinstance(price_stability_threshold, (list, tuple, np.ndarray)):
+            price_stability_threshold = float(price_stability_threshold[0])
+        else:
+            price_stability_threshold = float(price_stability_threshold)
+
+        # For price stability detection
+        price_changes_history = []
+        max_stable_count = 3  # Number of iterations with stable prices to confirm convergence
+        stable_count = 0
+            
         # Record auction start with data collector
         if data_collector is not None:
             data_collector.record_iteration(0, {
@@ -224,7 +238,9 @@ class GPUAccelerator:
                 'num_tasks': num_tasks,
                 'epsilon': epsilon,
                 'theoretical_max_iter': theoretical_max_iter,
-                'max_iterations': max_iterations
+                'max_iterations': max_iterations,
+                'termination_mode': termination_mode,
+                'price_stability_threshold': price_stability_threshold
             })
         
         # Initialize message counter and iteration counter
@@ -245,9 +261,6 @@ class GPUAccelerator:
             # Find unassigned tasks
             unassigned = (t_assign == 0).nonzero().flatten()
             
-            if len(unassigned) == 0:
-                break  # All tasks assigned
-            
             # Record iteration start with data collector
             if data_collector is not None:
                 # Convert prices to dictionary for data collector
@@ -264,6 +277,9 @@ class GPUAccelerator:
             
             # Track tasks assigned in this iteration
             tasks_assigned_this_iter = 0
+            
+            # Track price changes in this iteration
+            price_changes = []
             
             # For each operational robot
             for r_idx in op_robots:
@@ -343,6 +359,9 @@ class GPUAccelerator:
                         price_increase = epsilon + best_utility  # Key formula includes epsilon
                         new_price = old_price + price_increase
                         
+                        # Track price change for stability detection
+                        price_changes.append(float(price_increase))
+                        
                         print(f"DEBUG: Task {task_idx} - Old price: {old_price:.4f}, " 
                             f"Increase: {price_increase:.4f} (epsilon={epsilon:.4f}, utility={best_utility:.4f}), "
                             f"New price: {new_price:.4f}")
@@ -385,23 +404,58 @@ class GPUAccelerator:
                         # Track assignments in this iteration
                         tasks_assigned_this_iter += 1
             
+            # Calculate average price change
+            avg_price_change = sum(price_changes) / len(price_changes) if price_changes else 0
+            price_changes_history.append(avg_price_change)
+            
             # Record iteration end with data collector
             if data_collector is not None:
                 data_collector.record_iteration(iteration, {
                     'phase': 'gpu_iteration_end',
                     'tasks_assigned': tasks_assigned_this_iter,
                     'unassigned_remaining': len(unassigned),
-                    'messages_sent': messages
+                    'messages_sent': messages,
+                    'avg_price_change': avg_price_change
                 })
             
-            # If no tasks were assigned in this iteration, break
-            if tasks_assigned_this_iter == 0:
-                break
+            # Check termination conditions based on mode
+            if termination_mode == "assignment-complete":
+                # Original termination logic
+                if len(unassigned) == 0:
+                    # All tasks assigned
+                    break
+                if tasks_assigned_this_iter == 0:
+                    # No progress in this iteration
+                    break
+                    
+            elif termination_mode == "price-stabilized":
+                # Check price stability
+                if avg_price_change < price_stability_threshold:
+                    stable_count += 1
+                    if stable_count >= max_stable_count:
+                        # Prices have stabilized for several consecutive iterations
+                        break
+                else:
+                    stable_count = 0
+                    
+                # Also break if all tasks assigned (common sense)
+                if len(unassigned) == 0:
+                    break
         
         # Debug logging for bid statistics
         print(f"DEBUG: Auction completed in {iterations_used}/{max_iterations} iterations")
         print(f"DEBUG: Final bid stats - Min: {min_bid:.4f}, Max: {max_bid:.4f}")
         print(f"DEBUG: Messages sent: {messages}")
+        
+        # Determine termination reason
+        if iterations_used >= max_iterations:
+            termination_reason = 'max_iterations'
+        elif len(unassigned) == 0:
+            termination_reason = 'all_assigned'
+        elif tasks_assigned_this_iter == 0:
+            termination_reason = 'no_progress'
+        else:
+            termination_reason = 'price_stabilized'
         
         # Record auction completion with data collector
         if data_collector is not None:
@@ -426,7 +480,9 @@ class GPUAccelerator:
                 'max_bid': max_bid,
                 'min_bid': min_bid,
                 'price_update_history': price_updates,
-                'bid_history': bid_history
+                'bid_history': bid_history,
+                'termination_reason': termination_reason,
+                'price_changes_history': price_changes_history
             })
         
         return t_assign.cpu().numpy(), prices_tensor.cpu().numpy(), messages

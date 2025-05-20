@@ -63,13 +63,45 @@ class ExperimentRunner:
         """
         params = self.config['parameters']
         
+        # Ensure all parameter values are lists, even if they are single values in config
+        num_tasks = params['num_tasks']
+        comm_delay = params['comm_delay']
+        packet_loss = params['packet_loss']
+        epsilon = params['epsilon']
+        
+        # Convert any single values to lists
+        if not isinstance(num_tasks, list):
+            num_tasks = [num_tasks]
+        if not isinstance(comm_delay, list):
+            comm_delay = [comm_delay]
+        if not isinstance(packet_loss, list):
+            packet_loss = [packet_loss]
+        if not isinstance(epsilon, list):
+            epsilon = [epsilon]
+        
+        # Include termination mode in parameter combinations if present
+        termination_modes = params.get('termination_mode', ["assignment-complete"])
+        if isinstance(termination_modes, str):
+            termination_modes = [termination_modes]  # Convert single string to list
+        
         # Create all parameter combinations
-        param_combinations = list(product(
-            params['num_tasks'],
-            params['comm_delay'],
-            params['packet_loss'],
-            params['epsilon']
-        ))
+        if 'termination_mode' in params and len(termination_modes) > 1:
+            # Include termination mode in combinations
+            param_combinations = list(product(
+                num_tasks,
+                comm_delay,
+                packet_loss,
+                epsilon,
+                termination_modes
+            ))
+        else:
+            # Original combinations without termination mode
+            param_combinations = list(product(
+                num_tasks,
+                comm_delay,
+                packet_loss,
+                epsilon
+            ))
         
         # Number of repetitions per combination
         num_runs = self.config['experiment'].get('num_runs', 1)
@@ -78,6 +110,7 @@ class ExperimentRunner:
         full_combinations = []
         for combo in param_combinations:
             for run in range(num_runs):
+                # Add run index to the end
                 full_combinations.append(combo + (run,))
         
         print(f"Running {len(full_combinations)} experiments "
@@ -181,12 +214,26 @@ class ExperimentRunner:
         
         Args:
             param_combo: Parameter combination tuple (num_tasks, comm_delay, packet_loss, epsilon, run_index)
+                or with termination mode: (num_tasks, comm_delay, packet_loss, epsilon, termination_mode, run_index)
             
         Returns:
             dict: Experiment results
         """
-        num_tasks, comm_delay, packet_loss, epsilon, run_index = param_combo
+        # Handle param_combo with or without termination_mode
+        if len(param_combo) == 6:
+            num_tasks, comm_delay, packet_loss, epsilon, termination_mode, run_index = param_combo
+        else:
+            num_tasks, comm_delay, packet_loss, epsilon, run_index = param_combo
+            # Use default termination mode from config or fallback to assignment-complete
+            termination_mode = self.config.get('parameters', {}).get('termination_mode', "assignment-complete")
         
+        # Get price stability threshold from config or use default
+        price_stability_threshold = self.config.get('parameters', {}).get('price_stability_threshold', 0.01)
+        
+        # Ensure price_stability_threshold is a scalar
+        if isinstance(price_stability_threshold, (list, tuple)):
+            price_stability_threshold = price_stability_threshold[0]
+            
         # Set random seed for reproducibility
         random_seed = self.config['experiment']['random_seed'] + run_index
         np.random.seed(random_seed)
@@ -199,7 +246,9 @@ class ExperimentRunner:
             comm_delay=comm_delay,
             packet_loss=packet_loss,
             epsilon=epsilon,
-            use_gpu=self.config.get('use_gpu', False)
+            use_gpu=self.config.get('use_gpu', False),
+            termination_mode=termination_mode,
+            price_stability_threshold=price_stability_threshold
         )
         
         # Generate random tasks
@@ -234,6 +283,7 @@ class ExperimentRunner:
             'comm_delay': comm_delay,
             'packet_loss': packet_loss,
             'epsilon': epsilon,
+            'termination_mode': termination_mode,
             'run_index': run_index,
             'makespan': makespan,
             'message_count': message_count,

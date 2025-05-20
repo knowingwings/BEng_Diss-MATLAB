@@ -4,6 +4,8 @@ parameters:
   comm_delay: [0, 50, 200, 500]  # ms - Matches Table 2
   packet_loss: [0, 0.1, 0.3, 0.5]  # Matches Table 2
   epsilon: [0.01, 0.05, 0.2, 0.5]  # Matches Table 2
+  termination_mode: "price-stabilized"
+  price_stability_threshold: [0.01, 0.05, 0.2, 0.5]  # Test different thresholds
 
 experiment:
   num_runs: 30 

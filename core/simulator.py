@@ -11,7 +11,9 @@ from core.task import Task, TaskDependencyGraph
 from core.auction import DistributedAuction
 
 class Simulator:
-    def __init__(self, num_robots=2, workspace_size=(10, 8), comm_delay=0, packet_loss=0, epsilon=0.01, use_gpu=False):
+    def __init__(self, num_robots=2, workspace_size=(10, 8), comm_delay=0, packet_loss=0, 
+             epsilon=0.01, use_gpu=False, termination_mode="assignment-complete", 
+             price_stability_threshold=0.01):
         """Initialize simulator
         
         Args:
@@ -21,6 +23,8 @@ class Simulator:
             packet_loss: Probability of packet loss
             epsilon: Minimum bid increment for auction algorithm
             use_gpu: Whether to use GPU acceleration
+            termination_mode: "assignment-complete" or "price-stabilized"
+            price_stability_threshold: Threshold for price stability detection
         """
         self.workspace_size = workspace_size
         self.sim_time = 0.0
@@ -29,6 +33,8 @@ class Simulator:
         self.packet_loss = packet_loss
         self.epsilon = epsilon
         self.use_gpu = use_gpu
+        self.termination_mode = termination_mode
+        self.price_stability_threshold = price_stability_threshold
         
         # Initialize robots
         self.robots = []
@@ -279,7 +285,9 @@ class Simulator:
                 'epsilon': self.epsilon,
                 'num_tasks': len(self.tasks),
                 'comm_delay': self.comm_delay,
-                'packet_loss': self.packet_loss
+                'packet_loss': self.packet_loss,
+                'termination_mode': self.termination_mode,
+                'price_stability_threshold': self.price_stability_threshold
             })
         
         # Run centralized solver for comparison
@@ -325,8 +333,14 @@ class Simulator:
                                     self.task_graph.is_available(task.id)]
                     
                     if unassigned_tasks:
-                        # Run auction
-                        _, messages = self.auction.run_auction(self.robots, self.tasks, self.task_graph)
+                        # Run auction with termination mode from configuration
+                        _, messages = self.auction.run_auction(
+                            self.robots, 
+                            self.tasks, 
+                            self.task_graph,
+                            termination_mode=self.termination_mode,
+                            price_stability_threshold=self.price_stability_threshold
+                        )
                         self.metrics['message_count'] += messages
                         
                         # Update task assignments array
