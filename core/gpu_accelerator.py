@@ -140,9 +140,27 @@ class GPUAccelerator:
         return bids
             
     def run_auction_gpu(self, robot_positions, robot_capabilities, robot_statuses, 
-                    task_positions, task_capabilities, task_assignments, 
-                    epsilon, prices, weights=None):
-        """Run distributed auction algorithm on GPU"""
+                   task_positions, task_capabilities, task_assignments, 
+                   epsilon, prices, weights=None, data_collector=None,
+                   unassigned_task_ids=None):
+        """Run distributed auction algorithm on GPU
+        
+        Args:
+            robot_positions: Robot positions as numpy array
+            robot_capabilities: Robot capabilities as numpy array
+            robot_statuses: List of robot status strings
+            task_positions: Task positions as numpy array
+            task_capabilities: Task capabilities as numpy array
+            task_assignments: Current task assignments as numpy array
+            epsilon: Minimum bid increment
+            prices: Current prices as numpy array
+            weights: Dictionary of weights for bid calculation
+            data_collector: Optional data collector for metrics
+            unassigned_task_ids: Optional list of original task IDs for data collection
+            
+        Returns:
+            tuple: (new_assignments, new_prices, message_count)
+        """
         # Apply communication delay
         if self.communication_delay > 0:
             time.sleep(self.communication_delay)
@@ -199,6 +217,16 @@ class GPUAccelerator:
         # Set a practical upper limit to prevent excessive iterations
         max_iterations = min(theoretical_max_iter, 1000)
         
+        # Record auction start with data collector
+        if data_collector is not None:
+            data_collector.record_iteration(0, {
+                'phase': 'gpu_auction_start',
+                'num_tasks': num_tasks,
+                'epsilon': epsilon,
+                'theoretical_max_iter': theoretical_max_iter,
+                'max_iterations': max_iterations
+            })
+        
         # Initialize message counter and iteration counter
         messages = 0
         iterations_used = 0
@@ -206,6 +234,10 @@ class GPUAccelerator:
         # Track bid statistics for debugging
         max_bid = 0.0
         min_bid = float('inf')
+        
+        # Store history of price updates for data collection
+        price_updates = []
+        bid_history = []
         
         for iteration in range(max_iterations):
             iterations_used += 1
@@ -215,6 +247,20 @@ class GPUAccelerator:
             
             if len(unassigned) == 0:
                 break  # All tasks assigned
+            
+            # Record iteration start with data collector
+            if data_collector is not None:
+                # Convert prices to dictionary for data collector
+                price_dict = {}
+                for i, price in enumerate(prices_tensor.cpu().numpy()):
+                    task_id = unassigned_task_ids[i] if unassigned_task_ids else i+1
+                    price_dict[task_id] = float(price)
+                
+                data_collector.record_iteration(iteration, {
+                    'phase': 'gpu_iteration_start',
+                    'unassigned_count': len(unassigned),
+                    'prices': price_dict
+                })
             
             # Track tasks assigned in this iteration
             tasks_assigned_this_iter = 0
@@ -263,6 +309,25 @@ class GPUAccelerator:
                 prices_unassigned = prices_tensor[task_indices]
                 utilities = bids[0] - prices_unassigned
                 
+                # Record bids with data collector
+                if data_collector is not None and unassigned_task_ids is not None:
+                    for j, task_idx in enumerate(task_indices):
+                        task_id = unassigned_task_ids[task_idx] if task_idx < len(unassigned_task_ids) else task_idx+1
+                        robot_id = int(r_idx.cpu().numpy()) + 1
+                        bid_value = float(bids[0, j].cpu().numpy())
+                        utility_value = float(utilities[j].cpu().numpy())
+                        
+                        data_collector.record_bid(robot_id, task_id, bid_value, utility_value)
+                        
+                        # Store for history
+                        bid_history.append({
+                            'iteration': iteration,
+                            'robot_id': robot_id,
+                            'task_id': task_id,
+                            'bid': bid_value,
+                            'utility': utility_value
+                        })
+                
                 # Find best task for this robot
                 if len(utilities) > 0:
                     best_idx = torch.argmax(utilities).item()
@@ -282,11 +347,34 @@ class GPUAccelerator:
                             f"Increase: {price_increase:.4f} (epsilon={epsilon:.4f}, utility={best_utility:.4f}), "
                             f"New price: {new_price:.4f}")
                         
+                        # Record price update with data collector
+                        if data_collector is not None and unassigned_task_ids is not None:
+                            task_id = unassigned_task_ids[task_idx] if task_idx < len(unassigned_task_ids) else task_idx+1
+                            data_collector.record_price_update(
+                                task_id, old_price, new_price, epsilon, best_utility)
+                            
+                            # Store for history
+                            price_updates.append({
+                                'iteration': iteration,
+                                'task_id': task_id,
+                                'old_price': old_price,
+                                'new_price': new_price,
+                                'epsilon': epsilon,
+                                'utility': best_utility,
+                                'price_increase': price_increase
+                            })
+                        
                         # Update price
                         prices_tensor[task_idx] = new_price
                         
                         # Assign task to robot
                         t_assign[task_idx] = r_idx + 1  # +1 because assignment 0 means unassigned
+                        
+                        # Record assignment with data collector
+                        if data_collector is not None and unassigned_task_ids is not None:
+                            task_id = unassigned_task_ids[task_idx] if task_idx < len(unassigned_task_ids) else task_idx+1
+                            robot_id = int(r_idx.cpu().numpy()) + 1
+                            data_collector.record_assignment(task_id, robot_id, iteration)
                         
                         # Update unassigned tasks
                         unassigned = (t_assign == 0).nonzero().flatten()
@@ -297,6 +385,15 @@ class GPUAccelerator:
                         # Track assignments in this iteration
                         tasks_assigned_this_iter += 1
             
+            # Record iteration end with data collector
+            if data_collector is not None:
+                data_collector.record_iteration(iteration, {
+                    'phase': 'gpu_iteration_end',
+                    'tasks_assigned': tasks_assigned_this_iter,
+                    'unassigned_remaining': len(unassigned),
+                    'messages_sent': messages
+                })
+            
             # If no tasks were assigned in this iteration, break
             if tasks_assigned_this_iter == 0:
                 break
@@ -305,5 +402,31 @@ class GPUAccelerator:
         print(f"DEBUG: Auction completed in {iterations_used}/{max_iterations} iterations")
         print(f"DEBUG: Final bid stats - Min: {min_bid:.4f}, Max: {max_bid:.4f}")
         print(f"DEBUG: Messages sent: {messages}")
+        
+        # Record auction completion with data collector
+        if data_collector is not None:
+            # Convert final prices and assignments to dictionaries
+            final_prices = {}
+            final_assignments = {}
+            
+            for i, (price, assignment) in enumerate(zip(prices_tensor.cpu().numpy(), t_assign.cpu().numpy())):
+                task_id = unassigned_task_ids[i] if unassigned_task_ids and i < len(unassigned_task_ids) else i+1
+                final_prices[task_id] = float(price)
+                
+                if assignment > 0:  # If assigned
+                    robot_id = int(assignment)
+                    final_assignments[task_id] = robot_id
+            
+            data_collector.record_iteration(iterations_used, {
+                'phase': 'gpu_auction_complete',
+                'total_iterations': iterations_used,
+                'final_prices': final_prices,
+                'final_assignments': final_assignments,
+                'total_messages': messages,
+                'max_bid': max_bid,
+                'min_bid': min_bid,
+                'price_update_history': price_updates,
+                'bid_history': bid_history
+            })
         
         return t_assign.cpu().numpy(), prices_tensor.cpu().numpy(), messages

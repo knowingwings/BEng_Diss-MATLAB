@@ -69,29 +69,45 @@ def basic_visualize(results_dir, output_dir=None, interactive=False):
         print(f"Error loading CSV: {e}")
         return
     
-    # Identify factor variables - more flexible matching
-    factor_var_patterns = ['num_tasks', 'comm_delay', 'packet_loss', 'epsilon', 
-                          'task', 'delay', 'loss', 'eps']
+    # IMPROVED: Identify factor variables more reliably
     factor_vars = []
+    for column in data.columns:
+        col_lower = column.lower()
+        if any(param in col_lower for param in ['task', 'delay', 'loss', 'epsilon', 'eps']):
+            factor_vars.append(column)
     
-    for col in data.columns:
-        col_lower = col.lower()
-        for pattern in factor_var_patterns:
-            if pattern in col_lower:
-                factor_vars.append(col)
-                break
+    # Manually identify the epsilon column - this is critical for our analysis
+    epsilon_column = None
+    for column in data.columns:
+        col_lower = column.lower()
+        if 'epsilon' in col_lower or 'eps' in col_lower:
+            epsilon_column = column
+            break
     
-    # Identify response variables - more flexible matching
-    response_var_patterns = ['makespan', 'message_count', 'optimality_gap', 'recovery_time', 'make', 
-                           'message', 'count', 'optim', 'gap', 'recovery', '_mean']
+    # If we couldn't find epsilon, look for columns with values that match expected epsilon ranges
+    if epsilon_column is None:
+        for column in data.columns:
+            if data[column].dtype in [np.float64, np.float32]:
+                values = data[column].unique()
+                # Typical epsilon values are small (0.01 to 10)
+                if len(values) > 1 and all(0 < v < 20 for v in values if v > 0):
+                    epsilon_column = column
+                    print(f"Auto-detected epsilon column: {column} with values {values}")
+                    break
+    
+    # IMPROVED: Identify response variables more reliably
     response_vars = []
+    response_patterns = ['makespan', 'message', 'count', 'gap', 'recovery', 'completion']
     
-    for col in data.columns:
-        col_lower = col.lower()
-        for pattern in response_var_patterns:
-            if pattern in col_lower and not any(f in col_lower for f in factor_var_patterns):
-                response_vars.append(col)
-                break
+    for column in data.columns:
+        col_lower = column.lower()
+        if any(pattern in col_lower for pattern in response_patterns) and column not in factor_vars:
+            response_vars.append(column)
+    
+    # Add any columns with 'mean' suffix
+    for column in data.columns:
+        if '_mean' in column.lower() and column not in response_vars:
+            response_vars.append(column)
     
     if not factor_vars:
         print("Error: Could not identify factor variables")
@@ -105,6 +121,7 @@ def basic_visualize(results_dir, output_dir=None, interactive=False):
     
     print(f"Factor variables: {factor_vars}")
     print(f"Response variables: {response_vars}")
+    print(f"Epsilon column: {epsilon_column}")
     
     # Generate visualizations
     
@@ -145,92 +162,240 @@ def basic_visualize(results_dir, output_dir=None, interactive=False):
             plt.savefig(os.path.join(output_dir, 'correlation_matrix.png'), dpi=300)
             plt.close()
     
-    # Get task and makespan columns (with flexible names)
-    task_col = next((col for col in factor_vars if 'task' in col.lower()), None)
-    makespan_col = next((col for col in response_vars if 'make' in col.lower()), None)
+    # 3. IMPROVED: Dedicated non-normalized epsilon plots to show raw effects
+    if epsilon_column is not None:
+        # Create dedicated directory for epsilon analysis
+        epsilon_dir = os.path.join(output_dir, 'epsilon_analysis')
+        os.makedirs(epsilon_dir, exist_ok=True)
+        
+        # For each response variable, create a non-normalized plot to show raw effects
+        for response in response_vars:
+            if response not in data.columns:
+                continue
+                
+            # Create a basic line plot without normalization
+            plt.figure(figsize=(10, 6))
+            
+            # Group by epsilon only
+            means = data.groupby(epsilon_column)[response].mean().reset_index()
+            
+            # Sort by epsilon value
+            means = means.sort_values(by=epsilon_column)
+            
+            # Plot the raw data
+            plt.plot(means[epsilon_column], means[response], 'bo-', linewidth=2, markersize=8)
+            plt.xlabel(f'Epsilon', fontsize=12)
+            plt.ylabel(response, fontsize=12)
+            plt.title(f'Raw Effect of Epsilon on {response}', fontsize=14)
+            plt.grid(True)
+            
+            # Add trendline
+            try:
+                z = np.polyfit(means[epsilon_column], means[response], 1)
+                p = np.poly1d(z)
+                plt.plot(means[epsilon_column], p(means[epsilon_column]), "r--", 
+                        linewidth=1, label=f"Trend: y={z[0]:.2f}x+{z[1]:.2f}")
+                plt.legend()
+            except:
+                pass
+                
+            plt.tight_layout()
+            plt.savefig(os.path.join(epsilon_dir, f'epsilon_raw_effect_{response}.png'), dpi=300)
+            plt.close()
+            
+            # 3b. Create a separate plot controlling for other factors
+            # Group by epsilon and other factors to see interactions
+            for factor in factor_vars:
+                if factor == epsilon_column or factor not in data.columns:
+                    continue
+                    
+                plt.figure(figsize=(10, 6))
+                
+                # Prepare data for multi-line plot
+                factor_values = sorted(data[factor].unique())
+                
+                for value in factor_values:
+                    # Filter data for this factor value
+                    filtered = data[data[factor] == value]
+                    
+                    # Group by epsilon and calculate mean
+                    means = filtered.groupby(epsilon_column)[response].mean().reset_index()
+                    
+                    # Sort by epsilon
+                    means = means.sort_values(by=epsilon_column)
+                    
+                    if not means.empty:
+                        plt.plot(means[epsilon_column], means[response], 'o-', 
+                                linewidth=2, markersize=6, label=f"{factor}={value}")
+                
+                plt.xlabel(f'Epsilon', fontsize=12)
+                plt.ylabel(response, fontsize=12)
+                plt.title(f'Effect of Epsilon on {response} by {factor}', fontsize=14)
+                plt.grid(True)
+                plt.legend()
+                
+                plt.tight_layout()
+                plt.savefig(os.path.join(epsilon_dir, f'epsilon_by_{factor}_{response}.png'), dpi=300)
+                plt.close()
+        
+        # 3c. Create a summary plot specifically for optimality gap vs epsilon
+        optimality_gap_col = next((col for col in response_vars if 'gap' in col.lower()), None)
+        if optimality_gap_col:
+            plt.figure(figsize=(10, 6))
+            
+            # Focus on the relationship between epsilon and optimality gap
+            means = data.groupby(epsilon_column)[optimality_gap_col].mean().reset_index()
+            means = means.sort_values(by=epsilon_column)
+            
+            # Plot theoretical vs actual
+            plt.plot(means[epsilon_column], means[optimality_gap_col], 'bo-', 
+                    linewidth=2, label='Actual Gap')
+            
+            # Add theoretical bound line (2*epsilon)
+            epsilon_values = means[epsilon_column].values
+            theoretical = 2 * epsilon_values
+            plt.plot(epsilon_values, theoretical, 'r--', linewidth=2, 
+                    label='Theoretical Bound (2ε)')
+            
+            plt.xlabel('Epsilon (ε)', fontsize=12)
+            plt.ylabel('Optimality Gap', fontsize=12)
+            plt.title('Optimality Gap vs Epsilon with Theoretical Bound', fontsize=14)
+            plt.grid(True)
+            plt.legend()
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(epsilon_dir, 'optimality_gap_vs_epsilon.png'), dpi=300)
+            plt.close()
     
-    # 3. Makespan vs Task Count with theoretical bound
-    if task_col and makespan_col:
+    # 4. Message count vs epsilon (should show inverse relationship)
+    message_count_col = next((col for col in response_vars if 'message' in col.lower() or 'count' in col.lower()), None)
+    if message_count_col and epsilon_column:
         plt.figure(figsize=(10, 6))
-        task_counts = sorted(data[task_col].unique())
-        makespan_avg = [data[data[task_col] == tc][makespan_col].mean() for tc in task_counts]
         
-        # Plot actual makespan
-        plt.plot(task_counts, makespan_avg, 'bo-', linewidth=2, label='Actual Makespan')
+        # Group by epsilon only for message count
+        means = data.groupby(epsilon_column)[message_count_col].mean().reset_index()
+        means = means.sort_values(by=epsilon_column)
         
-        # Plot theoretical bound (O(K²))
-        if task_counts and makespan_avg and task_counts[0] > 0 and makespan_avg[0] > 0:
-            scale_factor = makespan_avg[0] / (task_counts[0]**2)
-            theoretical = [tc**2 * scale_factor for tc in task_counts]
-            plt.plot(task_counts, theoretical, 'r--', linewidth=2, label='Theoretical O(K²)')
+        # Plot the data
+        plt.plot(means[epsilon_column], means[message_count_col], 'go-', 
+                linewidth=2, markersize=8)
         
-        plt.xlabel('Number of Tasks (K)', fontsize=12)
-        plt.ylabel('Makespan (seconds)', fontsize=12)
-        plt.title('Makespan vs Task Count with Theoretical Bound', fontsize=14)
-        plt.legend()
+        # Try to add a 1/x curve fit to show inverse relationship
+        try:
+            # Fit 1/x model: y = a/x + b
+            def func(x, a, b):
+                return a/x + b
+                
+            from scipy.optimize import curve_fit
+            popt, pcov = curve_fit(func, means[epsilon_column], means[message_count_col])
+            
+            x_fit = np.linspace(min(means[epsilon_column]), max(means[epsilon_column]), 100)
+            y_fit = func(x_fit, *popt)
+            
+            plt.plot(x_fit, y_fit, 'r--', linewidth=1, 
+                    label=f"Fit: y={popt[0]:.1f}/x+{popt[1]:.1f}")
+            plt.legend()
+        except:
+            pass
+        
+        plt.xlabel('Epsilon (ε)', fontsize=12)
+        plt.ylabel('Message Count', fontsize=12)
+        plt.title('Message Count vs Epsilon', fontsize=14)
         plt.grid(True)
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'makespan_vs_tasks.png'), dpi=300)
-        plt.close()
-    
-    # Get optimality gap, comm delay and packet loss columns (with flexible names)
-    gap_col = next((col for col in response_vars if 'gap' in col.lower() or 'optim' in col.lower()), None)
-    delay_col = next((col for col in factor_vars if 'delay' in col.lower()), None)
-    loss_col = next((col for col in factor_vars if 'loss' in col.lower() or 'packet' in col.lower()), None)
-    
-    # 4. Optimality gap vs Communication parameters
-    if gap_col and delay_col and loss_col:
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-        
-        # Optimality gap vs comm_delay
-        sns.boxplot(x=delay_col, y=gap_col, data=data, ax=ax1)
-        ax1.set_title('Optimality Gap vs Communication Delay', fontsize=14)
-        ax1.set_xlabel('Communication Delay (ms)', fontsize=12)
-        ax1.set_ylabel('Optimality Gap', fontsize=12)
-        ax1.grid(True, alpha=0.3)
-        
-        # Optimality gap vs packet_loss
-        sns.boxplot(x=loss_col, y=gap_col, data=data, ax=ax2)
-        ax2.set_title('Optimality Gap vs Packet Loss Probability', fontsize=14)
-        ax2.set_xlabel('Packet Loss Probability', fontsize=12)
-        ax2.set_ylabel('Optimality Gap', fontsize=12)
-        ax2.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'optimality_gap_comm_params.png'), dpi=300)
+        plt.savefig(os.path.join(output_dir, 'message_count_vs_epsilon.png'), dpi=300)
         plt.close()
     
-    # Get epsilon column (with flexible name)
-    eps_col = next((col for col in factor_vars if 'eps' in col.lower()), None)
-    
-    # 5. Performance across epsilon values
-    if eps_col:
+    # 5. Performance across epsilon values (normalized)
+    if epsilon_column:
         plt.figure(figsize=(12, 8))
         
         valid_responses = [r for r in response_vars if r in data.columns]
         for response in valid_responses:
-            # Normalize response for better comparison
-            eps_values = sorted(data[eps_col].unique())
-            response_means = []
+            # Group by epsilon and calculate mean
+            eps_means = data.groupby(epsilon_column)[response].mean().reset_index()
+            eps_means = eps_means.sort_values(by=epsilon_column)
             
-            for eps in eps_values:
-                filtered = data[data[eps_col] == eps]
-                response_means.append(filtered[response].mean())
-            
-            # Normalize
-            max_value = max(response_means) if response_means else 1
+            # Normalize for easier comparison across metrics
+            max_value = eps_means[response].max()
             if max_value > 0:
-                norm_response = [val/max_value for val in response_means]
-                plt.plot(eps_values, norm_response, marker='o', linewidth=2, label=response)
+                eps_means['normalized'] = eps_means[response] / max_value
+                plt.plot(eps_means[epsilon_column], eps_means['normalized'], 
+                        marker='o', linewidth=2, label=response)
         
-        plt.xlabel('Epsilon (minimum bid increment)', fontsize=12)
+        plt.xlabel('Epsilon (ε)', fontsize=12)
         plt.ylabel('Normalized Performance', fontsize=12)
-        plt.title('Effect of Epsilon on Performance Metrics', fontsize=14)
+        plt.title('Normalized Effect of Epsilon on Performance Metrics', fontsize=14)
         plt.legend()
         plt.grid(True)
         plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'epsilon_performance.png'), dpi=300)
+        plt.savefig(os.path.join(output_dir, 'normalized_epsilon_effects.png'), dpi=300)
         plt.close()
+    
+    # 6. Statistical analysis summary
+    if epsilon_column:
+        # Create a statistical summary table
+        stat_summary = pd.DataFrame(columns=['Response', 'R²', 'p-value', 'Direction'])
+        
+        for response in response_vars:
+            if response not in data.columns:
+                continue
+                
+            try:
+                # Simple linear regression: response ~ epsilon
+                from scipy import stats
+                
+                # Group by epsilon to reduce noise
+                means = data.groupby(epsilon_column)[response].mean().reset_index()
+                
+                # Calculate linear regression
+                slope, intercept, r_value, p_value, std_err = stats.linregress(
+                    means[epsilon_column], means[response])
+                
+                # Add to summary table
+                stat_summary = stat_summary.append({
+                    'Response': response,
+                    'R²': r_value**2,
+                    'p-value': p_value,
+                    'Direction': 'Positive' if slope > 0 else 'Negative'
+                }, ignore_index=True)
+            except:
+                pass
+        
+        # Save to file
+        if not stat_summary.empty:
+            stat_summary.to_csv(os.path.join(output_dir, 'epsilon_statistical_summary.csv'), index=False)
+            
+            # Create a visual table
+            plt.figure(figsize=(10, 6))
+            plt.axis('off')
+            plt.title('Statistical Analysis of Epsilon Effects', fontsize=16)
+            
+            # Create a table
+            table_data = []
+            for _, row in stat_summary.iterrows():
+                table_data.append([
+                    row['Response'],
+                    f"{row['R²']:.3f}",
+                    f"{row['p-value']:.3f}",
+                    row['Direction']
+                ])
+            
+            table = plt.table(
+                cellText=table_data,
+                colLabels=['Response', 'R²', 'p-value', 'Direction'],
+                loc='center',
+                cellLoc='center',
+                bbox=[0.2, 0.2, 0.6, 0.6]
+            )
+            
+            table.auto_set_font_size(False)
+            table.set_fontsize(12)
+            table.scale(1.2, 1.5)
+            
+            plt.savefig(os.path.join(output_dir, 'epsilon_statistical_table.png'), dpi=300)
+            plt.close()
     
     print(f"Visualizations generated in {output_dir}")
     
@@ -239,22 +404,20 @@ def basic_visualize(results_dir, output_dir=None, interactive=False):
         plt.figure(figsize=(10, 8))
         plt.title("Your Experiment Results")
         
-        if task_col and makespan_col:
-            task_counts = sorted(data[task_col].unique())
-            makespan_avg = [data[data[task_col] == tc][makespan_col].mean() for tc in task_counts]
+        if epsilon_column and message_count_col:
+            # Show epsilon vs message count
+            means = data.groupby(epsilon_column)[message_count_col].mean().reset_index()
+            means = means.sort_values(by=epsilon_column)
             
-            plt.plot(task_counts, makespan_avg, 'bo-', linewidth=2, label='Actual Makespan')
-            
-            if task_counts and makespan_avg and task_counts[0] > 0 and makespan_avg[0] > 0:
-                scale_factor = makespan_avg[0] / (task_counts[0]**2)
-                theoretical = [tc**2 * scale_factor for tc in task_counts]
-                plt.plot(task_counts, theoretical, 'r--', linewidth=2, label='Theoretical O(K²)')
-            
-            plt.xlabel('Number of Tasks (K)', fontsize=12)
-            plt.ylabel('Makespan (seconds)', fontsize=12)
-            plt.title('Makespan vs Task Count with Theoretical Bound', fontsize=14)
-            plt.legend()
+            plt.plot(means[epsilon_column], means[message_count_col], 'go-', 
+                    linewidth=2, markersize=8)
+            plt.xlabel('Epsilon (ε)', fontsize=12)
+            plt.ylabel('Message Count', fontsize=12)
+            plt.title('Message Count vs Epsilon', fontsize=14)
             plt.grid(True)
+        else:
+            plt.text(0.5, 0.5, "No suitable data for interactive plot", 
+                    ha='center', va='center', fontsize=14)
         
         try:
             plt.show()

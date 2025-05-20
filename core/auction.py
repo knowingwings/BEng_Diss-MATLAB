@@ -42,9 +42,12 @@ class DistributedAuction:
             except Exception as e:
                 print(f"Could not initialize GPU acceleration: {e}")
                 self.use_gpu = False
-                
-        # Add this line to maintain task prices between auctions
-        self.task_prices = {}  # Dictionary to store task prices
+        
+        # Add data collector initialization
+        from utils.data_collector import AuctionDataCollector
+        self.data_collector = AuctionDataCollector()
+        self.centralized_solver = None
+        self.centralized_solution = None
     
     def run_auction(self, robots, tasks, task_graph):
         """Run distributed auction algorithm for task allocation
@@ -57,8 +60,27 @@ class DistributedAuction:
         Returns:
             tuple: (assignments dict, message count)
         """
+        # Start a new run with configuration
+        if hasattr(self, 'data_collector'):
+            self.data_collector.start_run({
+                'epsilon': self.epsilon,
+                'num_tasks': len(tasks),
+                'comm_delay': self.communication_delay * 1000.0,  # Convert to ms
+                'packet_loss': self.packet_loss_prob
+            })
+        
         # Print debug information about parameters
         print(f"Running auction with epsilon={self.epsilon}, delay={self.communication_delay*1000}ms, packet_loss={self.packet_loss_prob}")
+        
+        # Run centralized solver for comparison if available
+        if hasattr(self, 'data_collector') and self.centralized_solver is None:
+            from core.centralized_solver import CentralizedSolver
+            self.centralized_solver = CentralizedSolver()
+            self.centralized_solution = self.centralized_solver.solve(robots, tasks)
+            
+            # Record optimal solution
+            if self.centralized_solution:
+                self.data_collector.current_run_metrics['centralized_solution'] = self.centralized_solution
         
         # Find unassigned tasks that are ready (prerequisites completed)
         unassigned_tasks = [task for task in tasks 
@@ -67,38 +89,68 @@ class DistributedAuction:
                         task_graph.is_available(task.id)]
         
         if not unassigned_tasks:
+            # Record run completion with data collector
+            if hasattr(self, 'data_collector'):
+                self.data_collector.record_iteration(0, {
+                    'phase': 'no_tasks',
+                    'message_count': 0
+                })
+                self.data_collector.end_run()
+            
             return {}, 0  # No tasks to assign
         
-        # Initialize prices for new tasks
-        for task in unassigned_tasks:
-            if task.id not in self.task_prices:
-                self.task_prices[task.id] = 0.0
-        
-        # Get current prices for tasks in this auction
-        prices = {task.id: self.task_prices.get(task.id, 0.0) for task in tasks}
-            
         # Use GPU implementation if enabled and possible
         if self.use_gpu and len(robots) > 0 and len(unassigned_tasks) > 0:
             # Update GPU accelerator communication parameters
             self.gpu.set_communication_params(self.communication_delay, self.packet_loss_prob)
-            assignments, new_prices, messages = self._run_auction_gpu(robots, unassigned_tasks, tasks)
-            
-            # Update stored prices
-            for task_id, price in new_prices.items():
-                self.task_prices[task_id] = price
-            
-            return assignments, messages
+            assignments, messages = self._run_auction_gpu(robots, unassigned_tasks, tasks)
         else:
             assignments, messages = self._run_auction_cpu(robots, unassigned_tasks, tasks)
-            
-            # Update stored prices from CPU auction
-            for task_id, price in prices.items():
-                self.task_prices[task_id] = price
-            
-            return assignments, messages
         
+        # Calculate optimality gap if centralized solution is available
+        optimality_gap = None
+        if hasattr(self, 'centralized_solution') and self.centralized_solution:
+            # Find makespan based on current assignment
+            current_makespan = 0
+            for robot in robots:
+                if robot.status != 'operational':
+                    continue
+                    
+                robot_tasks = [task for task in tasks if task.assigned_to == robot.id]
+                robot_makespan = sum(task.completion_time for task in robot_tasks)
+                current_makespan = max(current_makespan, robot_makespan)
+            
+            # Calculate optimality gap
+            optimal_makespan = self.centralized_solution.get('makespan', 0)
+            if optimal_makespan > 0:
+                optimality_gap = (current_makespan - optimal_makespan) / optimal_makespan
+        
+        # Record run completion with data collector
+        if hasattr(self, 'data_collector'):
+            completion_data = {
+                'phase': 'auction_complete',
+                'assignments': len(assignments),
+                'messages': messages
+            }
+            
+            if optimality_gap is not None:
+                completion_data['optimality_gap'] = optimality_gap
+            
+            self.data_collector.record_iteration(
+                self.data_collector.current_iteration,
+                completion_data
+            )
+            
+            # End the run
+            self.data_collector.end_run({
+                'message_count': messages,
+                'optimality_gap': optimality_gap
+            })
+        
+        return assignments, messages
+    
     def _run_auction_gpu(self, robots, unassigned_tasks, all_tasks):
-        """GPU-accelerated auction implementation"""
+        """GPU-accelerated auction implementation with enhanced data collection"""
         # Debug logging to track epsilon's effect
         print(f"DEBUG: Using epsilon={self.epsilon} in GPU auction")
         
@@ -113,11 +165,21 @@ class DistributedAuction:
         # Map unassigned tasks to their indices in all_tasks
         task_id_to_idx = {task.id: i for i, task in enumerate(unassigned_tasks)}
         
-        # Retrieve current prices for tasks in this auction
-        current_prices = np.array([self.task_prices.get(task.id, 0.0) for task in unassigned_tasks], dtype=np.float32)
-        
         # Current assignments and prices
         task_assignments = np.zeros(len(unassigned_tasks), dtype=np.int32)
+        prices = np.zeros(len(unassigned_tasks), dtype=np.float32)
+        
+        # Record initial state for data collection
+        if hasattr(self, 'data_collector'):
+            # Create price dictionary for all tasks
+            price_dict = {task.id: 0.0 for task in all_tasks}
+            
+            self.data_collector.record_iteration(0, {
+                'phase': 'gpu_auction_start',
+                'num_tasks': len(unassigned_tasks),
+                'epsilon': self.epsilon,
+                'prices': price_dict.copy()
+            })
         
         # Create weights dictionary with epsilon explicitly included
         weights = self.weights.copy()
@@ -127,35 +189,61 @@ class DistributedAuction:
         new_assignments, new_prices, messages = self.gpu.run_auction_gpu(
             robot_positions, robot_capabilities, robot_statuses,
             task_positions, task_capabilities, task_assignments,
-            self.epsilon, current_prices,  # Use current prices instead of zeros
-            weights=weights  # Pass weights including epsilon
+            self.epsilon, prices,
+            weights=weights,  # Pass weights including epsilon
+            data_collector=self.data_collector if hasattr(self, 'data_collector') else None,
+            unassigned_task_ids=[task.id for task in unassigned_tasks]
         )
         
         # Convert results back to dictionary format
         assignments = {}
-        price_updates = {}
         
+        # Record final auction state for data collection
+        if hasattr(self, 'data_collector'):
+            # Create final price and assignment dictionaries
+            final_prices = {}
+            final_assignments = {}
+            
+            for i, task in enumerate(unassigned_tasks):
+                robot_idx = new_assignments[i]
+                price = new_prices[i]
+                
+                final_prices[task.id] = price
+                
+                if robot_idx > 0:  # If assigned
+                    robot_id = robots[robot_idx-1].id
+                    final_assignments[task.id] = robot_id
+            
+            self.data_collector.record_iteration(1, {  # GPU uses a single "iteration"
+                'phase': 'gpu_auction_complete',
+                'final_prices': final_prices,
+                'final_assignments': final_assignments,
+                'total_messages': messages
+            })
+        
+        # Process task assignments
         for i, task in enumerate(unassigned_tasks):
             robot_idx = new_assignments[i]
             if robot_idx > 0:  # If assigned
                 robot_id = robots[robot_idx-1].id
                 task.assigned_to = robot_id
                 assignments[task.id] = robot_id
-            
-            # Update task prices in the class dictionary
-            price_updates[task.id] = new_prices[i]
+                
+                # Record assignment for data collection
+                if hasattr(self, 'data_collector'):
+                    self.data_collector.record_assignment(task.id, robot_id, 1)  # GPU uses a single "iteration"
         
-        return assignments, price_updates, messages
-        
+        return assignments, messages
+    
     def _run_auction_cpu(self, robots, unassigned_tasks, tasks):
-        """Original CPU implementation"""
+        """Original CPU implementation with enhanced data collection"""
         # Track assignments and prices
         prices = {task.id: 0.0 for task in tasks}
         assignments = {task.id: 0 for task in tasks}
         messages_sent = 0
         
         # Set max_iterations based on theoretical bound: K² · bₘₐₓ/ε 
-        # where K is task count and bₘₐₓ is maximum possible bid
+        # where K is task count and bₘₐₓ is maximum possible bid value
         K = len(unassigned_tasks)
         b_max = 100.0  # Estimate of maximum possible bid value
         theoretical_max_iter = int(K**2 * b_max / self.epsilon)
@@ -163,12 +251,34 @@ class DistributedAuction:
         # Set a practical upper limit to prevent excessive iterations
         max_iterations = min(theoretical_max_iter, 1000)
         
+        # Debug logging for data collection
+        if hasattr(self, 'data_collector'):
+            self.data_collector.record_iteration(0, {
+                'phase': 'auction_start',
+                'num_tasks': len(unassigned_tasks),
+                'max_iterations': max_iterations,
+                'epsilon': self.epsilon,
+                'theoretical_max_iter': theoretical_max_iter
+            })
+        
         # Run auction algorithm
         iter_count = 0
         
         while unassigned_tasks and iter_count < max_iterations:
             iter_count += 1
             tasks_assigned_this_iter = 0
+            
+            # Create a snapshot of prices at the start of this iteration
+            # for data collection and correct utility calculations
+            current_prices = prices.copy()
+            
+            # If using data collection, record iteration start
+            if hasattr(self, 'data_collector'):
+                self.data_collector.record_iteration(iter_count, {
+                    'phase': 'iteration_start',
+                    'unassigned_count': len(unassigned_tasks),
+                    'prices': current_prices.copy()
+                })
             
             # For each robot, calculate bids for unassigned tasks
             for robot in robots:
@@ -206,7 +316,12 @@ class DistributedAuction:
                     messages_sent += 1
                     
                     # Calculate utility (bid - price)
-                    utility = bid - prices[task.id]
+                    task_price = current_prices[task.id]  # Use snapshot price
+                    utility = bid - task_price
+                    
+                    # Record bid and utility for data collection
+                    if hasattr(self, 'data_collector'):
+                        self.data_collector.record_bid(robot.id, task.id, bid, utility)
                     
                     if utility > best_utility:
                         best_utility = utility
@@ -223,18 +338,50 @@ class DistributedAuction:
                     if random.random() < self.packet_loss_prob:
                         continue  # Packet loss on assignment message
                         
-                    # Update price - critical for maintaining 2ε optimality gap
-                    prices[best_task.id] = prices[best_task.id] + self.epsilon + best_utility
+                    # Calculate old and new price
+                    old_price = prices[best_task.id]
+                    
+                    # CRITICAL: Apply epsilon in price update formula - clearly separate components
+                    price_increase = self.epsilon + best_utility
+                    new_price = old_price + price_increase
+                    
+                    # Debug logging for price update
+                    print(f"DEBUG: Task {best_task.id} - Old price: {old_price:.4f}, "
+                        f"Increase: {price_increase:.4f} (epsilon={self.epsilon:.4f}, "
+                        f"utility={best_utility:.4f}), New price: {new_price:.4f}")
+                    
+                    # Record price update for data collection
+                    if hasattr(self, 'data_collector'):
+                        self.data_collector.record_price_update(
+                            best_task.id, old_price, new_price, self.epsilon, best_utility)
+                    
+                    # Update price
+                    prices[best_task.id] = new_price
                     
                     # Assign task to robot
                     best_task.assigned_to = robot.id
                     assignments[best_task.id] = robot.id
+                    
+                    # Record assignment for data collection
+                    if hasattr(self, 'data_collector'):
+                        self.data_collector.record_assignment(
+                            best_task.id, robot.id, iter_count)
                     
                     # Remove from unassigned tasks
                     unassigned_tasks.remove(best_task)
                     
                     messages_sent += 1  # Assignment message
                     tasks_assigned_this_iter += 1
+            
+            # Record iteration end with data collector
+            if hasattr(self, 'data_collector'):
+                self.data_collector.record_iteration(iter_count, {
+                    'phase': 'iteration_end',
+                    'tasks_assigned': tasks_assigned_this_iter,
+                    'unassigned_remaining': len(unassigned_tasks),
+                    'messages_this_iter': messages_sent,
+                    'current_prices': prices.copy()
+                })
             
             # If no tasks were assigned in this iteration, break to ensure convergence
             if tasks_assigned_this_iter == 0:
@@ -243,6 +390,17 @@ class DistributedAuction:
         # Log if we hit the iteration limit (useful for debugging)
         if iter_count >= max_iterations and unassigned_tasks:
             print(f"Warning: CPU Auction reached maximum iterations ({max_iterations}) with {len(unassigned_tasks)} tasks still unassigned.")
+        
+        # Record final iteration status with data collector
+        if hasattr(self, 'data_collector'):
+            self.data_collector.record_iteration(iter_count + 1, {
+                'phase': 'auction_complete',
+                'total_iterations': iter_count,
+                'unassigned_remaining': len(unassigned_tasks),
+                'total_messages': messages_sent,
+                'final_prices': prices.copy(),
+                'final_assignments': assignments.copy()
+            })
         
         # Handle collaborative tasks (simplified)
         collaborative_tasks = [task for task in tasks 
@@ -257,6 +415,12 @@ class DistributedAuction:
                 # In a real system, this would require coordination
                 task.assigned_to = operational_robots[0].id
                 assignments[task.id] = operational_robots[0].id
+                
+                # Record assignment for data collection
+                if hasattr(self, 'data_collector'):
+                    self.data_collector.record_assignment(
+                        task.id, operational_robots[0].id, iter_count)
+                    
                 messages_sent += 1
         
         return assignments, messages_sent
@@ -274,6 +438,8 @@ class DistributedAuction:
         """
         # Print debug info
         print(f"Running recovery auction for {len(failed_tasks)} tasks with {len(operational_robots)} robots")
+        # ADDED: Debug logging for epsilon in recovery auction
+        print(f"DEBUG: Using epsilon={self.epsilon} in recovery auction")
         
         assignments = {}
         messages_sent = 0
@@ -295,12 +461,14 @@ class DistributedAuction:
             # Update GPU accelerator communication parameters
             self.gpu.set_communication_params(self.communication_delay, self.packet_loss_prob)
             
+            # IMPROVED: Explicit epsilon handling for recovery
             # Run GPU auction with parameters adjusted for recovery
             new_assignments, _, messages = self.gpu.run_auction_gpu(
                 robot_positions, robot_capabilities, robot_statuses,
                 task_positions, task_capabilities, task_assignments,
                 self.epsilon * 2,  # Higher epsilon for faster convergence in recovery
-                prices
+                prices,
+                weights={'epsilon': self.epsilon * 2}  # Explicit epsilon for recovery
             )
             
             # Process results

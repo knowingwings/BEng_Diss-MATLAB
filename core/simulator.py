@@ -237,7 +237,7 @@ class Simulator:
             return recovery_time
     
     def run_simulation(self, max_time, inject_failure=True, failure_time_fraction=0.3, visualize=False):
-        """Run simulation for specified time with performance optimizations
+        """Run simulation for specified time with enhanced data collection
         
         Args:
             max_time: Maximum simulation time
@@ -272,6 +272,21 @@ class Simulator:
         if visualize:
             for robot in self.robots:
                 robot.reset_trajectory()
+        
+        # Initialize data collection
+        if hasattr(self.auction, 'data_collector'):
+            self.auction.data_collector.start_run({
+                'epsilon': self.epsilon,
+                'num_tasks': len(self.tasks),
+                'comm_delay': self.comm_delay,
+                'packet_loss': self.packet_loss
+            })
+        
+        # Run centralized solver for comparison
+        if hasattr(self.auction, 'centralized_solution') and self.auction.centralized_solution is None:
+            from core.centralized_solver import CentralizedSolver
+            self.auction.centralized_solver = CentralizedSolver()
+            self.auction.centralized_solution = self.auction.centralized_solver.solve(self.robots, self.tasks)
         
         # Track when failures were injected and recovered
         failure_time = None
@@ -481,6 +496,14 @@ class Simulator:
             if failed_tasks and not recovery_complete_time:
                 print(f"DEBUG: Initiating recovery for {len(failed_tasks)} tasks")
                 
+                # Record start of recovery in data collector if available
+                if hasattr(self.auction, 'data_collector'):
+                    self.auction.data_collector.record_iteration(0, {
+                        'phase': 'recovery_start',
+                        'failure_time': failure_time,
+                        'failed_tasks': len(failed_tasks)
+                    })
+                
                 # Call recovery function
                 recovery_time = self.run_recovery(failed_tasks)
                 
@@ -493,6 +516,14 @@ class Simulator:
                 
                 print(f"DEBUG: Recovery completed with time {recovery_time:.2f}s")
                 self.log_event(f"Recovery completed at t={recovery_complete_time:.2f}s, took {recovery_time:.2f}s")
+                
+                # Record recovery completion in data collector if available
+                if hasattr(self.auction, 'data_collector'):
+                    self.auction.data_collector.record_iteration(0, {
+                        'phase': 'recovery_complete',
+                        'recovery_time': recovery_time,
+                        'recovery_complete_time': recovery_complete_time
+                    })
                 
                 # Add detailed recovery information to metrics_history for visualization
                 self.metrics_history.append({
@@ -591,7 +622,19 @@ class Simulator:
             self.metrics['recovery_time'] = recovery_time
             print(f"DEBUG: Final metrics include recovery_time: {recovery_time:.2f}s")
         
+        # Calculate optimality gap if centralized solution is available
+        if hasattr(self.auction, 'centralized_solution') and self.auction.centralized_solution:
+            optimal_makespan = self.auction.centralized_solution.get('makespan', 0)
+            if optimal_makespan > 0:
+                self.metrics['optimality_gap'] = (self.metrics['makespan'] - optimal_makespan) / optimal_makespan
+        
         print(f"DEBUG: Final metrics: {self.metrics}")
+        
+        # End data collection
+        if hasattr(self.auction, 'data_collector'):
+            self.auction.data_collector.end_run(self.metrics)
+            self.auction.data_collector.save_session_summary()
+        
         return self.metrics
     
     def visualize(self, ax=None, show_trajectories=True):
