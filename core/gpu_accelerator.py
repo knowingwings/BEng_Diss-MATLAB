@@ -84,20 +84,8 @@ class GPUAccelerator:
         return tensor.cpu().numpy()
         
     def calculate_bids_batch(self, robot_positions, robot_capabilities, task_positions, 
-                    task_capabilities, workloads, weights):
-        """Calculate bids for all robot-task combinations in a single batch operation
-        
-        Args:
-            robot_positions: Tensor of robot positions [num_robots, 2]
-            robot_capabilities: Tensor of robot capabilities [num_robots, cap_dim]
-            task_positions: Tensor of task positions [num_tasks, 2]
-            task_capabilities: Tensor of task capabilities [num_tasks, cap_dim]
-            workloads: Tensor of robot workloads [num_robots]
-            weights: Dictionary of weight parameters
-            
-        Returns:
-            Tensor of bids [num_robots, num_tasks]
-        """
+                task_capabilities, workloads, weights):
+        """Calculate bids for all robot-task combinations in a single batch operation"""
         # Convert inputs to tensors
         r_pos = self.to_tensor(robot_positions)
         r_cap = self.to_tensor(robot_capabilities)
@@ -112,107 +100,46 @@ class GPUAccelerator:
         alpha4 = weights['alpha4']
         alpha5 = weights.get('alpha5', 0.1)
         
+        # CRITICAL FIX: Extract epsilon properly from weights
+        epsilon = weights.get('epsilon', 0.01)
+        
         # Get dimensions
         num_robots = r_pos.shape[0]
         num_tasks = t_pos.shape[0]
         
-        # Special handling for AMD GPUs via CUDA to prevent instability
-        if self.is_amd_via_cuda and (num_robots > 10 or num_tasks > 50):
-            # Break calculation into smaller chunks to avoid memory issues
-            # This is a simple approach - we could optimize this further if needed
-            chunk_size = 10
-            bids = torch.zeros((num_robots, num_tasks), device=self.device)
+        # Calculate distances (batch operation)
+        r_pos_expanded = r_pos.unsqueeze(1)
+        t_pos_expanded = t_pos.unsqueeze(0)
+        distances = torch.sqrt(torch.sum((r_pos_expanded - t_pos_expanded)**2, dim=2) + 1e-10)
+        
+        # Calculate terms
+        distance_term = alpha1 / (distances + 1e-10)
+        
+        # Calculate proper configuration cost
+        r_cap_expanded = r_cap.unsqueeze(1)
+        t_cap_expanded = t_cap.unsqueeze(0)
+        config_diffs = r_cap_expanded - t_cap_expanded
+        config_costs = torch.sqrt(torch.sum(config_diffs**2, dim=2) + 1e-6)
+        config_term = alpha2 / (config_costs + 1e-10)
+        
+        # Calculate capability similarity
+        r_cap_norm = torch.norm(r_cap, dim=1, keepdim=True)
+        t_cap_norm = torch.norm(t_cap, dim=1, keepdim=True)
+        dot_products = torch.sum(r_cap_expanded * t_cap_expanded, dim=2)
+        norms_product = r_cap_norm * t_cap_norm.t()
+        similarity = dot_products / (norms_product + 1e-10)
+        capability_term = alpha3 * similarity
+        
+        # Calculate workload term
+        workload_term = alpha4 * work.unsqueeze(1).expand(-1, num_tasks)
+        
+        # CRITICAL FIX: Calculate bids WITHOUT epsilon scaling
+        # The original formula should not scale by epsilon, as epsilon is used in price updates
+        bids = distance_term + config_term + capability_term - workload_term
+        
+        return bids
             
-            for i in range(0, num_robots, chunk_size):
-                end_i = min(i + chunk_size, num_robots)
-                for j in range(0, num_tasks, chunk_size):
-                    end_j = min(j + chunk_size, num_tasks)
-                    
-                    # Process this chunk
-                    r_pos_chunk = r_pos[i:end_i]
-                    r_cap_chunk = r_cap[i:end_i]
-                    t_pos_chunk = t_pos[j:end_j]
-                    t_cap_chunk = t_cap[j:end_j]
-                    work_chunk = work[i:end_i]
-                    
-                    # Calculate distances for this chunk
-                    r_pos_expanded = r_pos_chunk.unsqueeze(1)
-                    t_pos_expanded = t_pos_chunk.unsqueeze(0)
-                    distances = torch.sqrt(torch.sum((r_pos_expanded - t_pos_expanded)**2, dim=2) + 1e-10)
-                    
-                    # Calculate terms
-                    distance_term = alpha1 / (distances + 1e-10)
-                    
-                    # FIXED: Calculate proper configuration cost
-                    r_cap_expanded = r_cap_chunk.unsqueeze(1)
-                    t_cap_expanded = t_cap_chunk.unsqueeze(0)
-                    config_diffs = r_cap_expanded - t_cap_expanded
-                    config_costs = torch.sqrt(torch.sum(config_diffs**2, dim=2) + 1e-6)
-                    config_term = alpha2 / (config_costs + 1e-10)
-                    
-                    # Calculate capability similarity
-                    r_cap_norm = torch.norm(r_cap_chunk, dim=1, keepdim=True)
-                    t_cap_norm = torch.norm(t_cap_chunk, dim=1, keepdim=True)
-                    dot_products = torch.sum(r_cap_expanded * t_cap_expanded, dim=2)
-                    norms_product = r_cap_norm * t_cap_norm.t()
-                    similarity = dot_products / (norms_product + 1e-10)
-                    capability_term = alpha3 * similarity
-                    
-                    # Calculate workload term
-                    workload_term = alpha4 * work_chunk.unsqueeze(1).expand(-1, end_j-j)
-                    
-                    # ADDED: Get epsilon factor to make its effect more pronounced
-                    epsilon = weights.get('epsilon', 0.01)
-                    epsilon_factor = 1.0 / (epsilon + 1e-10)
-                    epsilon_scaling = torch.ones((end_i-i, end_j-j), device=self.device) * epsilon_factor
-                    
-                    # Calculate chunk bids with epsilon scaling
-                    chunk_bids = (distance_term + config_term + capability_term - workload_term) * epsilon_scaling
-                    bids[i:end_i, j:end_j] = chunk_bids
-                    
-                    # Free up memory
-                    torch.cuda.empty_cache()
-                
-            return bids
-        else:
-            # Standard calculation for CPU or stable GPU operations
-            # Calculate distances (batch operation)
-            r_pos_expanded = r_pos.unsqueeze(1)
-            t_pos_expanded = t_pos.unsqueeze(0)
-            distances = torch.sqrt(torch.sum((r_pos_expanded - t_pos_expanded)**2, dim=2) + 1e-10)
-            
-            # Calculate distance term
-            distance_term = alpha1 / (distances + 1e-10)
-            
-            # FIXED: Calculate proper configuration cost instead of using constant
-            r_cap_expanded = r_cap.unsqueeze(1)  # [num_robots, 1, cap_dim]
-            t_cap_expanded = t_cap.unsqueeze(0)  # [1, num_tasks, cap_dim]
-            config_diffs = r_cap_expanded - t_cap_expanded
-            config_costs = torch.sqrt(torch.sum(config_diffs**2, dim=2) + 1e-6)
-            config_term = alpha2 / (config_costs + 1e-10)
-            
-            # Calculate capability similarity
-            r_cap_norm = torch.norm(r_cap, dim=1, keepdim=True)
-            t_cap_norm = torch.norm(t_cap, dim=1, keepdim=True)
-            dot_products = torch.sum(r_cap_expanded * t_cap_expanded, dim=2)
-            norms_product = r_cap_norm * t_cap_norm.t()
-            similarity = dot_products / (norms_product + 1e-10)
-            capability_term = alpha3 * similarity
-            
-            # Calculate workload term
-            workload_term = alpha4 * work.unsqueeze(1).expand(-1, num_tasks)
-            
-            # ADDED: Get epsilon factor to make its effect more pronounced
-            epsilon = weights.get('epsilon', 0.01)
-            epsilon_factor = 1.0 / (epsilon + 1e-10)
-            epsilon_scaling = torch.ones((num_robots, num_tasks), device=self.device) * epsilon_factor
-            
-            # Calculate final bids with epsilon scaling
-            bids = (distance_term + config_term + capability_term - workload_term) * epsilon_scaling
-            
-            return bids
-            
-    def _run_auction_gpu(self, robot_positions, robot_capabilities, robot_statuses, 
+    def run_auction_gpu(self, robot_positions, robot_capabilities, robot_statuses, 
                     task_positions, task_capabilities, task_assignments, 
                     epsilon, prices, weights=None):
         """Run distributed auction algorithm on GPU"""

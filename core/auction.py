@@ -76,7 +76,7 @@ class DistributedAuction:
     
     def _run_auction_gpu(self, robots, unassigned_tasks, all_tasks):
         """GPU-accelerated auction implementation"""
-        # ADDED: Debug logging to track epsilon's effect
+        # Debug logging to track epsilon's effect
         print(f"DEBUG: Using epsilon={self.epsilon} in GPU auction")
         
         # Prepare data for GPU processing
@@ -94,16 +94,16 @@ class DistributedAuction:
         task_assignments = np.zeros(len(unassigned_tasks), dtype=np.int32)
         prices = np.zeros(len(unassigned_tasks), dtype=np.float32)
         
-        # ADDED: Include epsilon in weights for GPU accelerator
+        # Create weights dictionary with epsilon explicitly included
         weights = self.weights.copy()
-        weights['epsilon'] = self.epsilon
+        weights['epsilon'] = self.epsilon  # Critical: ensure epsilon is passed to GPU
         
         # Run GPU auction
         new_assignments, new_prices, messages = self.gpu.run_auction_gpu(
             robot_positions, robot_capabilities, robot_statuses,
             task_positions, task_capabilities, task_assignments,
             self.epsilon, prices,
-            weights=weights  # ADDED: Pass weights including epsilon
+            weights=weights  # Pass weights including epsilon
         )
         
         # Convert results back to dictionary format
