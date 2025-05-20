@@ -515,19 +515,6 @@ class Simulator:
                 else:
                     # No operational robots - balance is undefined
                     self.metrics['workload_balance'] = 0.0
-                
-                # Calculate completion rate
-                completed_count = np.sum(task_statuses == status_codes['completed'])
-                total_tasks = len(self.tasks)
-                
-                # Use a smoother formula for completion rate to avoid perfect 1.0
-                if total_tasks > 0:
-                    actual_completion = completed_count / total_tasks
-                    # Apply a small random factor to avoid perfectly identical values
-                    random_factor = 1.0 - np.random.uniform(0, 0.01)
-                    self.metrics['completion_rate'] = actual_completion * random_factor
-                else:
-                    self.metrics['completion_rate'] = 0.0
         
         progress.close()
         
