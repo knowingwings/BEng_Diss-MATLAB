@@ -84,7 +84,7 @@ class GPUAccelerator:
         return tensor.cpu().numpy()
         
     def calculate_bids_batch(self, robot_positions, robot_capabilities, task_positions, 
-                      task_capabilities, workloads, weights):
+                    task_capabilities, workloads, weights):
         """Calculate bids for all robot-task combinations in a single batch operation
         
         Args:
@@ -173,7 +173,7 @@ class GPUAccelerator:
                     # Free up memory
                     torch.cuda.empty_cache()
                 
-                return bids
+            return bids
         else:
             # Standard calculation for CPU or stable GPU operations
             # Calculate distances (batch operation)
@@ -213,24 +213,9 @@ class GPUAccelerator:
             return bids
             
     def run_auction_gpu(self, robot_positions, robot_capabilities, robot_statuses, 
-                task_positions, task_capabilities, task_assignments, 
-                epsilon, prices, weights=None):
-        """Run distributed auction algorithm on GPU
-        
-        Args:
-            robot_positions: Tensor of robot positions [num_robots, 2]
-            robot_capabilities: Tensor of robot capabilities [num_robots, cap_dim]
-            robot_statuses: List of robot status strings ['operational', 'failed', etc.]
-            task_positions: Tensor of task positions [num_tasks, 2]
-            task_capabilities: Tensor of task capabilities [num_tasks, cap_dim]
-            task_assignments: Tensor of current task assignments [num_tasks]
-            epsilon: Minimum bid increment
-            prices: Tensor of current prices [num_tasks]
-            weights: Dictionary of weight parameters (optional)
-            
-        Returns:
-            tuple: (new_assignments, new_prices, message_count)
-        """
+                    task_positions, task_capabilities, task_assignments, 
+                    epsilon, prices, weights=None):
+        """Run distributed auction algorithm on GPU"""
         # Apply communication delay
         if self.communication_delay > 0:
             time.sleep(self.communication_delay)
@@ -250,11 +235,11 @@ class GPUAccelerator:
                 'alpha5': 0.1
             }
         
-        # ADDED: Ensure epsilon is in weights
+        # CRITICAL: Ensure epsilon is explicitly included in weights
         weights['epsilon'] = epsilon
         
-        # ADDED: Debug logging for epsilon
-        print(f"DEBUG: GPU auction using epsilon={epsilon}, weights={weights}")
+        # Print debug info about epsilon
+        print(f"\nDEBUG: Starting GPU auction with epsilon={epsilon}")
         
         # Convert inputs to tensors
         r_pos = self.to_tensor(robot_positions)
@@ -279,10 +264,10 @@ class GPUAccelerator:
         workloads = torch.zeros(len(robot_statuses), device=self.device)
         
         # Set max_iterations based on theoretical bound: K² · bₘₐₓ/ε 
-        # where K is task count and bₘₐₓ is maximum possible bid
+        # where K is task count and bₘₐₓ is maximum possible bid value
         K = num_tasks
         b_max = 100.0  # Estimate of maximum possible bid value
-        theoretical_max_iter = int(K**2 * b_max / epsilon)
+        theoretical_max_iter = int(K**2 * b_max / max(epsilon, 0.001))  # Avoid division by zero
         
         # Set a practical upper limit to prevent excessive iterations
         max_iterations = min(theoretical_max_iter, 1000)
@@ -291,7 +276,7 @@ class GPUAccelerator:
         messages = 0
         iterations_used = 0
         
-        # ADDED: Track bid statistics for debugging
+        # Track bid statistics for debugging
         max_bid = 0.0
         min_bid = float('inf')
         
@@ -337,7 +322,7 @@ class GPUAccelerator:
                     weights
                 )
                 
-                # ADDED: Track bid statistics
+                # Track bid statistics
                 if bids.numel() > 0:
                     current_max = float(torch.max(bids))
                     current_min = float(torch.min(bids))
@@ -360,9 +345,18 @@ class GPUAccelerator:
                         # Get original task index
                         task_idx = task_indices[best_idx]
                         
-                        # FIXED: Update price with epsilon - critical for 2ε optimality gap
-                        # This is where epsilon has its main effect in the auction algorithm
-                        prices_tensor[task_idx] = prices_tensor[task_idx] + epsilon + best_utility
+                        # KEY FIX: The critical price update formula for auction algorithms
+                        # This is where epsilon directly affects the algorithm output
+                        old_price = float(prices_tensor[task_idx].item())
+                        price_increase = epsilon + best_utility  # Key formula includes epsilon
+                        new_price = old_price + price_increase
+                        
+                        print(f"DEBUG: Task {task_idx} - Old price: {old_price:.4f}, " 
+                            f"Increase: {price_increase:.4f} (epsilon={epsilon:.4f}, utility={best_utility:.4f}), "
+                            f"New price: {new_price:.4f}")
+                        
+                        # Update price
+                        prices_tensor[task_idx] = new_price
                         
                         # Assign task to robot
                         t_assign[task_idx] = r_idx + 1  # +1 because assignment 0 means unassigned
@@ -377,19 +371,12 @@ class GPUAccelerator:
                         tasks_assigned_this_iter += 1
             
             # If no tasks were assigned in this iteration, break
-            # This prevents unnecessary iterations and ensures convergence
             if tasks_assigned_this_iter == 0:
                 break
         
-        # ADDED: Debug logging for bid statistics
-        print(f"DEBUG: Auction bid stats - Min: {min_bid:.4f}, Max: {max_bid:.4f}, Epsilon: {epsilon:.4f}")
-        print(f"DEBUG: Epsilon/MaxBid ratio: {epsilon/max_bid if max_bid > 0 else 0:.6f}")
-        print(f"DEBUG: Auction iterations: {iterations_used}/{max_iterations}, messages: {messages}")
-        
-        # For debugging/analysis - log if we hit iteration limit
-        if iterations_used >= max_iterations and len(unassigned) > 0:
-            import logging
-            logging.warning(f"GPU Auction reached maximum iterations ({max_iterations}) "
-                        f"with {len(unassigned)} tasks still unassigned.")
+        # Debug logging for bid statistics
+        print(f"DEBUG: Auction completed in {iterations_used}/{max_iterations} iterations")
+        print(f"DEBUG: Final bid stats - Min: {min_bid:.4f}, Max: {max_bid:.4f}")
+        print(f"DEBUG: Messages sent: {messages}")
         
         return t_assign.cpu().numpy(), prices_tensor.cpu().numpy(), messages

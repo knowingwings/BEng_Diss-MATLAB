@@ -138,41 +138,37 @@ class Simulator:
         return failed_robot, failed_tasks
     
     def run_recovery(self, failed_tasks):
-        """Run recovery process after robot failure
-        
-        Args:
-            failed_tasks: List of tasks that need reassignment
-            
-        Returns:
-            float: Recovery time
-        """
+        """Run recovery process after robot failure"""
         # Record start time for recovery
         start_time = self.sim_time
+        recovery_start_wall_time = time.time()
         
-        # ADDED: Debug logging about recovery start
-        print(f"DEBUG: Starting recovery at time {self.sim_time:.2f}s")
+        # Debug logging about recovery start
+        print(f"\nDEBUG: Starting recovery at simulation time {self.sim_time:.2f}s")
         print(f"DEBUG: {len(failed_tasks)} tasks need reassignment")
         
         # Get operational robots
         operational_robots = [r for r in self.robots if r.status == 'operational']
         
+        # Initialize recovery time
+        recovery_time = 0.0
+        
         if operational_robots and failed_tasks:
-            # ADDED: Explicitly advance time based on failure extent and communication delay
-            # This is essential for non-zero recovery time
-            
             # Basic recovery overhead (proportional to number of tasks)
             recovery_overhead = 0.1 * len(failed_tasks)  # 0.1s per failed task
             self.sim_time += recovery_overhead
             
-            print(f"DEBUG: Added initial recovery overhead: {recovery_overhead:.2f}s, new time: {self.sim_time:.2f}s")
+            print(f"DEBUG: Added initial recovery overhead: {recovery_overhead:.2f}s")
             
             # Run recovery auction
+            auction_start = time.time()
             assignments, messages = self.auction.run_recovery_auction(
                 operational_robots, failed_tasks, self.task_graph)
+            auction_duration = time.time() - auction_start
                 
             self.metrics['message_count'] += messages
             
-            # ADDED: Advance simulation time based on communication overhead
+            # Advance simulation time based on communication overhead
             # Time advances based on message count and communication delay
             comm_time = messages * (self.comm_delay / 1000.0) * 0.5  # Half of total theoretical delay
             
@@ -183,21 +179,39 @@ class Simulator:
             time_advancement = max(0.1, comm_time + processing_time)
             self.sim_time += time_advancement
             
-            print(f"DEBUG: Advanced time by {time_advancement:.2f}s for communication ({comm_time:.2f}s) and processing ({processing_time:.2f}s)")
-            
-            # Record recovery time - now will be non-zero due to time advancement
+            # CRITICAL FIX: Explicitly calculate and store recovery time
             recovery_time = self.sim_time - start_time
             self.metrics['recovery_time'] = recovery_time
             
-            print(f"DEBUG: Recovery time calculated: {recovery_time:.2f}s (from {start_time:.2f}s to {self.sim_time:.2f}s)")
-            print(f"DEBUG: Reallocation results: {len(assignments)} tasks reassigned")
+            # Add to metrics history to ensure it appears in plots
+            recovery_metrics = {
+                'time': self.sim_time,
+                'recovery_time': recovery_time,
+                'tasks_recovered': len(assignments),
+                'total_failed_tasks': len(failed_tasks)
+            }
+            
+            # Make sure metrics_history exists
+            if not hasattr(self, 'metrics_history'):
+                self.metrics_history = []
+            
+            # Add recovery metrics to history
+            self.metrics_history.append(recovery_metrics)
+            
+            # Print detailed debug information to verify values
+            wall_time_elapsed = time.time() - recovery_start_wall_time
+            print(f"DEBUG: Recovery process complete")
+            print(f"DEBUG: Simulation time advanced from {start_time:.2f}s to {self.sim_time:.2f}s")
+            print(f"DEBUG: Recovery time recorded: {recovery_time:.2f}s")
+            print(f"DEBUG: Wall clock time for recovery: {wall_time_elapsed:.2f}s")
+            print(f"DEBUG: Recovery metrics added to history: {recovery_metrics}")
             
             self.log_event(f"Recovery completed in {recovery_time:.2f}s")
             
             return recovery_time
-        
-        print("DEBUG: No recovery performed (no operational robots or no failed tasks)")
-        return 0.0
+        else:
+            print("DEBUG: No recovery performed (no operational robots or no failed tasks)")
+            return 0.0
     
     def run_simulation(self, max_time, inject_failure=True, failure_time_fraction=0.3, visualize=False):
         """Run simulation for specified time with performance optimizations
