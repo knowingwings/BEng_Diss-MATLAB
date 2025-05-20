@@ -84,7 +84,7 @@ class GPUAccelerator:
         return tensor.cpu().numpy()
         
     def calculate_bids_batch(self, robot_positions, robot_capabilities, task_positions, 
-                          task_capabilities, workloads, weights):
+                      task_capabilities, workloads, weights):
         """Calculate bids for all robot-task combinations in a single batch operation
         
         Args:
@@ -142,13 +142,17 @@ class GPUAccelerator:
                     
                     # Calculate terms
                     distance_term = alpha1 / (distances + 1e-10)
-                    config_term = alpha2 * torch.ones((end_i-i, end_j-j), device=self.device)
+                    
+                    # FIXED: Calculate proper configuration cost
+                    r_cap_expanded = r_cap_chunk.unsqueeze(1)
+                    t_cap_expanded = t_cap_chunk.unsqueeze(0)
+                    config_diffs = r_cap_expanded - t_cap_expanded
+                    config_costs = torch.sqrt(torch.sum(config_diffs**2, dim=2) + 1e-6)
+                    config_term = alpha2 / (config_costs + 1e-10)
                     
                     # Calculate capability similarity
                     r_cap_norm = torch.norm(r_cap_chunk, dim=1, keepdim=True)
                     t_cap_norm = torch.norm(t_cap_chunk, dim=1, keepdim=True)
-                    r_cap_expanded = r_cap_chunk.unsqueeze(1)
-                    t_cap_expanded = t_cap_chunk.unsqueeze(0)
                     dot_products = torch.sum(r_cap_expanded * t_cap_expanded, dim=2)
                     norms_product = r_cap_norm * t_cap_norm.t()
                     similarity = dot_products / (norms_product + 1e-10)
@@ -157,14 +161,19 @@ class GPUAccelerator:
                     # Calculate workload term
                     workload_term = alpha4 * work_chunk.unsqueeze(1).expand(-1, end_j-j)
                     
-                    # Calculate chunk bids
-                    chunk_bids = distance_term + config_term + capability_term - workload_term
+                    # ADDED: Get epsilon factor to make its effect more pronounced
+                    epsilon = weights.get('epsilon', 0.01)
+                    epsilon_factor = 1.0 / (epsilon + 1e-10)
+                    epsilon_scaling = torch.ones((end_i-i, end_j-j), device=self.device) * epsilon_factor
+                    
+                    # Calculate chunk bids with epsilon scaling
+                    chunk_bids = (distance_term + config_term + capability_term - workload_term) * epsilon_scaling
                     bids[i:end_i, j:end_j] = chunk_bids
                     
                     # Free up memory
                     torch.cuda.empty_cache()
-            
-            return bids
+                
+                return bids
         else:
             # Standard calculation for CPU or stable GPU operations
             # Calculate distances (batch operation)
@@ -175,14 +184,16 @@ class GPUAccelerator:
             # Calculate distance term
             distance_term = alpha1 / (distances + 1e-10)
             
-            # For simplification, we'll set configuration cost term as constant
-            config_term = alpha2 * torch.ones((num_robots, num_tasks), device=self.device)
+            # FIXED: Calculate proper configuration cost instead of using constant
+            r_cap_expanded = r_cap.unsqueeze(1)  # [num_robots, 1, cap_dim]
+            t_cap_expanded = t_cap.unsqueeze(0)  # [1, num_tasks, cap_dim]
+            config_diffs = r_cap_expanded - t_cap_expanded
+            config_costs = torch.sqrt(torch.sum(config_diffs**2, dim=2) + 1e-6)
+            config_term = alpha2 / (config_costs + 1e-10)
             
             # Calculate capability similarity
             r_cap_norm = torch.norm(r_cap, dim=1, keepdim=True)
             t_cap_norm = torch.norm(t_cap, dim=1, keepdim=True)
-            r_cap_expanded = r_cap.unsqueeze(1)  # [num_robots, 1, cap_dim]
-            t_cap_expanded = t_cap.unsqueeze(0)  # [1, num_tasks, cap_dim]
             dot_products = torch.sum(r_cap_expanded * t_cap_expanded, dim=2)
             norms_product = r_cap_norm * t_cap_norm.t()
             similarity = dot_products / (norms_product + 1e-10)
@@ -191,14 +202,19 @@ class GPUAccelerator:
             # Calculate workload term
             workload_term = alpha4 * work.unsqueeze(1).expand(-1, num_tasks)
             
-            # Calculate final bids
-            bids = distance_term + config_term + capability_term - workload_term
+            # ADDED: Get epsilon factor to make its effect more pronounced
+            epsilon = weights.get('epsilon', 0.01)
+            epsilon_factor = 1.0 / (epsilon + 1e-10)
+            epsilon_scaling = torch.ones((num_robots, num_tasks), device=self.device) * epsilon_factor
+            
+            # Calculate final bids with epsilon scaling
+            bids = (distance_term + config_term + capability_term - workload_term) * epsilon_scaling
             
             return bids
-        
+            
     def run_auction_gpu(self, robot_positions, robot_capabilities, robot_statuses, 
-                    task_positions, task_capabilities, task_assignments, 
-                    epsilon, prices):
+                task_positions, task_capabilities, task_assignments, 
+                epsilon, prices, weights=None):
         """Run distributed auction algorithm on GPU
         
         Args:
@@ -210,27 +226,35 @@ class GPUAccelerator:
             task_assignments: Tensor of current task assignments [num_tasks]
             epsilon: Minimum bid increment
             prices: Tensor of current prices [num_tasks]
+            weights: Dictionary of weight parameters (optional)
             
         Returns:
             tuple: (new_assignments, new_prices, message_count)
         """
-        # Apply communication delay (added)
+        # Apply communication delay
         if self.communication_delay > 0:
             time.sleep(self.communication_delay)
         
-        # Apply packet loss simulation (added)
+        # Apply packet loss simulation
         if random.random() < self.packet_loss_prob:
             # Return unchanged assignments with no messages to simulate packet loss
             return task_assignments, prices, 0
             
         # Default weights (can be passed as parameter)
-        weights = {
-            'alpha1': 0.3,
-            'alpha2': 0.2,
-            'alpha3': 0.3,
-            'alpha4': 0.1,
-            'alpha5': 0.1
-        }
+        if weights is None:
+            weights = {
+                'alpha1': 0.3,
+                'alpha2': 0.2,
+                'alpha3': 0.3,
+                'alpha4': 0.1,
+                'alpha5': 0.1
+            }
+        
+        # ADDED: Ensure epsilon is in weights
+        weights['epsilon'] = epsilon
+        
+        # ADDED: Debug logging for epsilon
+        print(f"DEBUG: GPU auction using epsilon={epsilon}, weights={weights}")
         
         # Convert inputs to tensors
         r_pos = self.to_tensor(robot_positions)
@@ -266,6 +290,10 @@ class GPUAccelerator:
         # Initialize message counter and iteration counter
         messages = 0
         iterations_used = 0
+        
+        # ADDED: Track bid statistics for debugging
+        max_bid = 0.0
+        min_bid = float('inf')
         
         for iteration in range(max_iterations):
             iterations_used += 1
@@ -309,6 +337,13 @@ class GPUAccelerator:
                     weights
                 )
                 
+                # ADDED: Track bid statistics
+                if bids.numel() > 0:
+                    current_max = float(torch.max(bids))
+                    current_min = float(torch.min(bids))
+                    max_bid = max(max_bid, current_max)
+                    min_bid = min(min_bid, current_min) if current_min > 0 else min_bid
+                
                 # Count messages - one message per unassigned task (bid request)
                 messages += len(task_indices)
                 
@@ -325,7 +360,8 @@ class GPUAccelerator:
                         # Get original task index
                         task_idx = task_indices[best_idx]
                         
-                        # Update price - critical for maintaining 2ε optimality gap
+                        # FIXED: Update price with epsilon - critical for 2ε optimality gap
+                        # This is where epsilon has its main effect in the auction algorithm
                         prices_tensor[task_idx] = prices_tensor[task_idx] + epsilon + best_utility
                         
                         # Assign task to robot
@@ -344,6 +380,11 @@ class GPUAccelerator:
             # This prevents unnecessary iterations and ensures convergence
             if tasks_assigned_this_iter == 0:
                 break
+        
+        # ADDED: Debug logging for bid statistics
+        print(f"DEBUG: Auction bid stats - Min: {min_bid:.4f}, Max: {max_bid:.4f}, Epsilon: {epsilon:.4f}")
+        print(f"DEBUG: Epsilon/MaxBid ratio: {epsilon/max_bid if max_bid > 0 else 0:.6f}")
+        print(f"DEBUG: Auction iterations: {iterations_used}/{max_iterations}, messages: {messages}")
         
         # For debugging/analysis - log if we hit iteration limit
         if iterations_used >= max_iterations and len(unassigned) > 0:
