@@ -319,8 +319,6 @@ class Simulator:
                             self.log_event(f"Task {task.id} completed at t={self.sim_time:.1f}s")
 
             
-            # Add this code after updating task progress in the main simulation loop
-
             # ADDED: Update robot workloads based on task assignments and progress
             # This maintains accurate workload regardless of visualization mode
             for robot in self.robots:
@@ -369,8 +367,8 @@ class Simulator:
                 # Log workload periodically
                 if step_count % 50 == 0:
                     print(f"DEBUG: Robot {robot.id} workload: {robot.workload:.2f} (tasks: {tasks_assigned}, " 
-                        f"capability: {capability_factor:.2f}, efficiency: {efficiency_factor:.2f})")
-                    
+                        f"capability: {capability_factor:.2f}, efficiency: {efficiency_factor:.2f}")
+                                
             # Only update robot positions if we're not in pure simulation mode
             if visualize:
                 # Move robots toward assigned tasks
@@ -529,7 +527,7 @@ class Simulator:
                 else:
                     # No operational robots - balance is undefined
                     self.metrics['workload_balance'] = 0.0
-        
+                    
         progress.close()
         
         # Calculate makespan (time of last task completion or simulation end)

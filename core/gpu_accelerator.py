@@ -212,7 +212,7 @@ class GPUAccelerator:
             
             return bids
             
-    def run_auction_gpu(self, robot_positions, robot_capabilities, robot_statuses, 
+    def _run_auction_gpu(self, robot_positions, robot_capabilities, robot_statuses, 
                     task_positions, task_capabilities, task_assignments, 
                     epsilon, prices, weights=None):
         """Run distributed auction algorithm on GPU"""
